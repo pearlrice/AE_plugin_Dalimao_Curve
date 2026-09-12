@@ -1,0 +1,5 @@
+// PiPL resource - embedded from binary under the named type "PIPL"
+// (AE's plugin loader only recognizes the "PIPL" resource type, not integer RCDATA)
+#include "winres.h"
+
+16000 PIPL "pipl_data.bin"
