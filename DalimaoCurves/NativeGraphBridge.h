@@ -7,10 +7,12 @@
 #include <uiautomation.h>
 #include <objbase.h>
 
+#include <algorithm>
 #include <atomic>
 #include <iterator>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #pragma comment(lib, "uiautomationcore.lib")
 #pragma comment(lib, "ole32.lib")
@@ -18,6 +20,7 @@
 #pragma comment(lib, "user32.lib")
 
 namespace NativeGraphBridge {
+inline constexpr wchar_t ControlsWindowClass[] = L"DalimaoCurveCursorPopup";
 namespace detail {
 
 enum class GraphState {
@@ -41,6 +44,7 @@ struct State {
     std::atomic<bool> desiredGraph{false};
     std::mutex statusMutex;
     std::wstring status = L"Native Graph bridge is idle";
+    std::wstring performance = L"Native Graph timing is unavailable";
     std::mutex lifecycleMutex;
 };
 
@@ -134,8 +138,8 @@ inline bool WaitForModifiersReleased(State& state, unsigned long long generation
     return false;
 }
 
-inline HRESULT FindUniqueTimeline(IUIAutomation* automation, HWND mainWindow,
-                                  IUIAutomationElement** timeline) {
+inline HRESULT FindUniqueTimelineFull(IUIAutomation* automation, HWND mainWindow,
+                                      IUIAutomationElement** timeline) {
     *timeline = nullptr;
     IUIAutomationElement* root = nullptr;
     HRESULT result = automation->ElementFromHandle(mainWindow, &root);
@@ -224,16 +228,237 @@ inline HRESULT FindUniqueTimeline(IUIAutomation* automation, HWND mainWindow,
     return S_OK;
 }
 
+struct NativeWindowCandidates {
+    HWND mainWindow = nullptr;
+    DWORD processId = 0;
+    std::vector<HWND> windows;
+};
+
+inline BOOL CALLBACK AddVisibleChildWindow(HWND hwnd, LPARAM contextValue) {
+    auto& context = *reinterpret_cast<NativeWindowCandidates*>(contextValue);
+    if (IsWindowVisible(hwnd) && SameProcessWindow(hwnd)) {
+        context.windows.push_back(hwnd);
+    }
+    return TRUE;
+}
+
+inline bool IsOwnedBy(HWND hwnd, HWND ownerRoot) {
+    for (HWND owner = GetWindow(hwnd, GW_OWNER); owner;
+         owner = GetWindow(owner, GW_OWNER)) {
+        if (owner == ownerRoot) return true;
+    }
+    return false;
+}
+
+inline BOOL CALLBACK AddVisibleOwnedWindow(HWND hwnd, LPARAM contextValue) {
+    auto& context = *reinterpret_cast<NativeWindowCandidates*>(contextValue);
+    if (hwnd == context.mainWindow || !IsWindowVisible(hwnd) ||
+        !SameProcessWindow(hwnd) || !IsOwnedBy(hwnd, context.mainWindow)) {
+        return TRUE;
+    }
+    // This class is registered by our own controls; it cannot contain an AE timeline.
+    // Querying its many standard Win32 controls through UIA adds substantial latency.
+    wchar_t className[128]{};
+    if (GetClassNameW(hwnd, className, static_cast<int>(std::size(className))) &&
+        wcscmp(className, ControlsWindowClass) == 0) return TRUE;
+    context.windows.push_back(hwnd);
+    EnumChildWindows(hwnd, AddVisibleChildWindow, contextValue);
+    return TRUE;
+}
+
+enum class NativeTimelineResult {
+    Unique,
+    Unresolved,
+    Ambiguous,
+};
+
+enum class TimelineDiscoveryPath {
+    NativeWindows,
+    FullTree,
+    Ambiguous,
+};
+
+inline thread_local TimelineDiscoveryPath g_lastDiscoveryPath =
+    TimelineDiscoveryPath::FullTree;
+
+inline NativeTimelineResult FindTimelineFromNativeWindows(
+        IUIAutomation* automation, HWND mainWindow,
+        IUIAutomationElement** timeline) {
+    *timeline = nullptr;
+    NativeWindowCandidates context;
+    context.mainWindow = mainWindow;
+    context.processId = GetCurrentProcessId();
+    EnumChildWindows(mainWindow, AddVisibleChildWindow,
+                     reinterpret_cast<LPARAM>(&context));
+    EnumWindows(AddVisibleOwnedWindow, reinterpret_cast<LPARAM>(&context));
+    std::sort(context.windows.begin(), context.windows.end(), [](HWND first, HWND second) {
+        return reinterpret_cast<UINT_PTR>(first) < reinterpret_cast<UINT_PTR>(second);
+    });
+    context.windows.erase(std::unique(context.windows.begin(), context.windows.end()),
+                          context.windows.end());
+
+    IUIAutomationCacheRequest* request = nullptr;
+    HRESULT result = automation->CreateCacheRequest(&request);
+    if (FAILED(result) || !request) return NativeTimelineResult::Unresolved;
+    result = request->put_TreeScope(TreeScope_Element);
+    for (PROPERTYID property : {
+             UIA_NamePropertyId, UIA_ControlTypePropertyId,
+             UIA_NativeWindowHandlePropertyId, UIA_ProcessIdPropertyId,
+             UIA_IsOffscreenPropertyId, UIA_BoundingRectanglePropertyId }) {
+        if (SUCCEEDED(result)) result = request->AddProperty(property);
+    }
+    if (FAILED(result)) {
+        request->Release();
+        return NativeTimelineResult::Unresolved;
+    }
+
+    int matches = 0;
+    bool metadataFailed = false;
+    for (HWND hwnd : context.windows) {
+        IUIAutomationElement* element = nullptr;
+        result = automation->ElementFromHandleBuildCache(hwnd, request, &element);
+        if (FAILED(result) || !element) {
+            metadataFailed = true;
+            if (element) element->Release();
+            continue;
+        }
+        BSTR nameValue = nullptr;
+        CONTROLTYPEID controlType = 0;
+        UIA_HWND nativeWindow = 0;
+        int processId = 0;
+        BOOL offscreen = TRUE;
+        RECT rect{};
+        bool valid = SUCCEEDED(element->get_CachedName(&nameValue)) && nameValue &&
+            SUCCEEDED(element->get_CachedControlType(&controlType)) &&
+            SUCCEEDED(element->get_CachedNativeWindowHandle(&nativeWindow)) &&
+            SUCCEEDED(element->get_CachedProcessId(&processId)) &&
+            SUCCEEDED(element->get_CachedIsOffscreen(&offscreen)) &&
+            SUCCEEDED(element->get_CachedBoundingRectangle(&rect));
+        if (!valid) metadataFailed = true;
+        const bool match = valid && std::wstring(nameValue, SysStringLen(nameValue)) == L"AE Timeline" &&
+            controlType == UIA_PaneControlTypeId &&
+            reinterpret_cast<HWND>(nativeWindow) == hwnd &&
+            processId == static_cast<int>(context.processId) && !offscreen &&
+            rect.right > rect.left && rect.bottom > rect.top;
+        if (nameValue) SysFreeString(nameValue);
+        if (match) {
+            ++matches;
+            if (matches == 1) {
+                *timeline = element;
+                element = nullptr;
+            }
+        }
+        if (element) element->Release();
+    }
+    request->Release();
+    if (matches > 1) {
+        if (*timeline) { (*timeline)->Release(); *timeline = nullptr; }
+        return NativeTimelineResult::Ambiguous;
+    }
+    if (matches == 1 && !metadataFailed) return NativeTimelineResult::Unique;
+    if (*timeline) { (*timeline)->Release(); *timeline = nullptr; }
+    return NativeTimelineResult::Unresolved;
+}
+
+inline HRESULT FindUniqueTimeline(IUIAutomation* automation, HWND mainWindow,
+                                  IUIAutomationElement** timeline) {
+    NativeTimelineResult nativeResult =
+        FindTimelineFromNativeWindows(automation, mainWindow, timeline);
+    if (nativeResult == NativeTimelineResult::Unique) {
+        g_lastDiscoveryPath = TimelineDiscoveryPath::NativeWindows;
+        return S_OK;
+    }
+    if (nativeResult == NativeTimelineResult::Ambiguous) {
+        g_lastDiscoveryPath = TimelineDiscoveryPath::Ambiguous;
+        return HRESULT_FROM_WIN32(ERROR_DUP_NAME);
+    }
+    g_lastDiscoveryPath = TimelineDiscoveryPath::FullTree;
+    return FindUniqueTimelineFull(automation, mainWindow, timeline);
+}
+
+inline bool ValidateTimeline(IUIAutomation* automation, IUIAutomationElement* timeline) {
+    if (!automation || !timeline) return false;
+    IUIAutomationCacheRequest* request = nullptr;
+    IUIAutomationElement* refreshed = nullptr;
+    HRESULT result = automation->CreateCacheRequest(&request);
+    if (SUCCEEDED(result) && !request) result = E_FAIL;
+    if (SUCCEEDED(result)) result = request->put_TreeScope(TreeScope_Element);
+    for (PROPERTYID property : { UIA_NamePropertyId, UIA_ControlTypePropertyId,
+             UIA_NativeWindowHandlePropertyId, UIA_ProcessIdPropertyId,
+             UIA_IsOffscreenPropertyId, UIA_BoundingRectanglePropertyId }) {
+        if (SUCCEEDED(result)) result = request->AddProperty(property);
+    }
+    if (SUCCEEDED(result)) result = timeline->BuildUpdatedCache(request, &refreshed);
+    if (request) request->Release();
+    BSTR name = nullptr;
+    CONTROLTYPEID type = 0;
+    UIA_HWND window = nullptr;
+    int pid = 0;
+    BOOL offscreen = TRUE;
+    RECT rect{};
+    const bool valid = SUCCEEDED(result) && refreshed &&
+        SUCCEEDED(refreshed->get_CachedName(&name)) && name &&
+        std::wstring(name, SysStringLen(name)) == L"AE Timeline" &&
+        SUCCEEDED(refreshed->get_CachedControlType(&type)) && type == UIA_PaneControlTypeId &&
+        SUCCEEDED(refreshed->get_CachedNativeWindowHandle(&window)) && SameProcessWindow(HWND(window)) &&
+        IsWindowVisible(HWND(window)) &&
+        SUCCEEDED(refreshed->get_CachedProcessId(&pid)) && DWORD(pid) == GetCurrentProcessId() &&
+        SUCCEEDED(refreshed->get_CachedIsOffscreen(&offscreen)) && !offscreen &&
+        SUCCEEDED(refreshed->get_CachedBoundingRectangle(&rect)) &&
+        rect.right > rect.left && rect.bottom > rect.top;
+    if (name) SysFreeString(name);
+    if (refreshed) refreshed->Release();
+    return valid;
+}
+
 inline GraphState ReadGraphState(IUIAutomation* automation,
                                  IUIAutomationElement* timeline) {
-    IUIAutomationCondition* trueCondition = nullptr;
+    // Retain COM identity only; refresh pane metadata and markers at every proof point.
+    if (!ValidateTimeline(automation, timeline)) return GraphState::Ambiguous;
+    IUIAutomationCondition* graphCondition = nullptr;
+    IUIAutomationCondition* zoomCondition = nullptr;
+    IUIAutomationCondition* markerCondition = nullptr;
+    IUIAutomationCacheRequest* request = nullptr;
     IUIAutomationElementArray* descendants = nullptr;
-    if (FAILED(automation->CreateTrueCondition(&trueCondition)) || !trueCondition) {
-        return GraphState::Ambiguous;
+    auto createNameCondition = [&](const wchar_t* name,
+                                   IUIAutomationCondition** condition) {
+        VARIANT value{};
+        value.vt = VT_BSTR;
+        value.bstrVal = SysAllocString(name);
+        if (!value.bstrVal) return E_OUTOFMEMORY;
+        HRESULT conditionResult = automation->CreatePropertyCondition(
+            UIA_NamePropertyId, value, condition);
+        VariantClear(&value);
+        return conditionResult;
+    };
+    HRESULT result = createNameCondition(L"Choose graph type and options",
+                                         &graphCondition);
+    if (SUCCEEDED(result)) {
+        result = createNameCondition(L"Auto-zoom graph height", &zoomCondition);
     }
-    HRESULT result = timeline->FindAll(TreeScope_Descendants, trueCondition,
-                                       &descendants);
-    trueCondition->Release();
+    if (SUCCEEDED(result)) {
+        result = automation->CreateOrCondition(graphCondition, zoomCondition,
+                                               &markerCondition);
+    }
+    if (SUCCEEDED(result)) result = automation->CreateCacheRequest(&request);
+    if (SUCCEEDED(result) && !request) result = E_FAIL;
+    if (SUCCEEDED(result) && request) {
+        result = request->put_TreeScope(TreeScope_Element);
+    }
+    for (PROPERTYID property : {
+             UIA_NamePropertyId, UIA_IsOffscreenPropertyId,
+             UIA_BoundingRectanglePropertyId }) {
+        if (SUCCEEDED(result)) result = request->AddProperty(property);
+    }
+    if (SUCCEEDED(result)) {
+        result = timeline->FindAllBuildCache(TreeScope_Descendants,
+                                             markerCondition, request,
+                                             &descendants);
+    }
+    if (request) request->Release();
+    if (markerCondition) markerCondition->Release();
+    if (zoomCondition) zoomCondition->Release();
+    if (graphCondition) graphCondition->Release();
     if (FAILED(result) || !descendants) {
         if (descendants) descendants->Release();
         return GraphState::Ambiguous;
@@ -242,17 +467,34 @@ inline GraphState ReadGraphState(IUIAutomation* automation,
     bool graphOptions = false;
     bool autoZoom = false;
     int length = 0;
-    descendants->get_Length(&length);
+    if (FAILED(descendants->get_Length(&length))) {
+        descendants->Release();
+        return GraphState::Ambiguous;
+    }
     for (int index = 0; index < length; ++index) {
         IUIAutomationElement* element = nullptr;
         if (FAILED(descendants->GetElement(index, &element)) || !element) {
-            continue;
+            descendants->Release();
+            return GraphState::Ambiguous;
         }
-        if (HasVisibleRect(element)) {
-            const std::wstring name = ElementName(element);
+        BSTR nameValue = nullptr;
+        BOOL offscreen = TRUE;
+        RECT rect{};
+        bool metadataValid = SUCCEEDED(element->get_CachedName(&nameValue)) && nameValue &&
+            SUCCEEDED(element->get_CachedIsOffscreen(&offscreen)) &&
+            SUCCEEDED(element->get_CachedBoundingRectangle(&rect));
+        if (!metadataValid) {
+            if (nameValue) SysFreeString(nameValue);
+            element->Release();
+            descendants->Release();
+            return GraphState::Ambiguous;
+        }
+        if (!offscreen && rect.right > rect.left && rect.bottom > rect.top) {
+            const std::wstring name(nameValue, SysStringLen(nameValue));
             graphOptions = graphOptions || name == L"Choose graph type and options";
             autoZoom = autoZoom || name == L"Auto-zoom graph height";
         }
+        if (nameValue) SysFreeString(nameValue);
         element->Release();
     }
     descendants->Release();
@@ -310,15 +552,89 @@ inline bool SendGraphShortcut() {
                      sizeof(INPUT)) == std::size(input);
 }
 
+inline double PerformanceNowMs() {
+    LARGE_INTEGER counter{}, frequency{};
+    QueryPerformanceCounter(&counter);
+    QueryPerformanceFrequency(&frequency);
+    return frequency.QuadPart ? 1000.0 * counter.QuadPart / frequency.QuadPart : 0.0;
+}
+
+struct PerformanceMetrics {
+    double discoveryMs = 0;
+    double stateMs = 0;
+    double modifierMs = 0;
+    double focusMs = 0;
+    double confirmationMs = 0;
+    double totalMs = 0;
+    int resolutions = 0;
+    int polls = 0;
+    int nativeDiscoveries = 0;
+    int fullDiscoveries = 0;
+};
+
+struct PerformanceTimer {
+    double& elapsed;
+    double started = PerformanceNowMs();
+    ~PerformanceTimer() { elapsed += PerformanceNowMs() - started; }
+};
+
+struct ElementReference {
+    IUIAutomationElement* element = nullptr;
+    explicit ElementReference(IUIAutomationElement* value) : element(value) {
+        if (element) element->AddRef();
+    }
+    ~ElementReference() { if (element) element->Release(); }
+    ElementReference(const ElementReference&) = delete;
+    ElementReference& operator=(const ElementReference&) = delete;
+};
+
+inline GraphState ReadGraphStateMeasured(IUIAutomation* automation,
+                                         IUIAutomationElement* timeline,
+                                         PerformanceMetrics* metrics) {
+    if (metrics) {
+        PerformanceTimer timer(metrics->stateMs);
+        return ReadGraphState(automation, timeline);
+    }
+    return ReadGraphState(automation, timeline);
+}
+
+inline std::wstring FormatPerformance(const PerformanceMetrics& metrics,
+                                      bool desiredGraph) {
+    wchar_t text[384]{};
+    swprintf_s(text,
+        L"Native Graph %s timing: total=%.1fms discovery=%.1fms state=%.1fms "
+        L"modifiers=%.1fms focus=%.1fms confirm=%.1fms resolves=%d polls=%d "
+        L"native=%d fallback=%d",
+        desiredGraph ? L"OPEN" : L"CLOSE", metrics.totalMs,
+        metrics.discoveryMs, metrics.stateMs, metrics.modifierMs,
+        metrics.focusMs, metrics.confirmationMs, metrics.resolutions,
+        metrics.polls, metrics.nativeDiscoveries, metrics.fullDiscoveries);
+    return text;
+}
+
 inline bool ResolveAndRead(IUIAutomation* automation, HWND mainWindow,
                            GraphState& graphState,
-                           IUIAutomationElement** timeline = nullptr) {
+                           IUIAutomationElement** timeline = nullptr,
+                           PerformanceMetrics* metrics = nullptr) {
     IUIAutomationElement* foundTimeline = nullptr;
-    if (FAILED(FindUniqueTimeline(automation, mainWindow, &foundTimeline)) ||
-        !foundTimeline) {
+    HRESULT findResult = E_FAIL;
+    if (metrics) {
+        ++metrics->resolutions;
+        PerformanceTimer timer(metrics->discoveryMs);
+        findResult = FindUniqueTimeline(automation, mainWindow, &foundTimeline);
+    } else {
+        findResult = FindUniqueTimeline(automation, mainWindow, &foundTimeline);
+    }
+    if (metrics) {
+        if (g_lastDiscoveryPath == TimelineDiscoveryPath::NativeWindows)
+            ++metrics->nativeDiscoveries;
+        else if (g_lastDiscoveryPath == TimelineDiscoveryPath::FullTree)
+            ++metrics->fullDiscoveries;
+    }
+    if (FAILED(findResult) || !foundTimeline) {
         return false;
     }
-    graphState = ReadGraphState(automation, foundTimeline);
+    graphState = ReadGraphStateMeasured(automation, foundTimeline, metrics);
     if (graphState == GraphState::Ambiguous) {
         foundTimeline->Release();
         if (timeline) {
@@ -336,7 +652,8 @@ inline bool ResolveAndRead(IUIAutomation* automation, HWND mainWindow,
 
 inline bool ProcessRequest(State& state, IUIAutomation* automation,
                            unsigned long long generation, HWND mainWindow,
-                           bool desiredGraph, std::wstring& resultStatus) {
+                           bool desiredGraph, std::wstring& resultStatus,
+                           PerformanceMetrics* metrics = nullptr) {
     if (!SameProcessWindow(mainWindow) || !IsWindowVisible(mainWindow)) {
         resultStatus = L"AE main window is unavailable";
         return false;
@@ -348,7 +665,7 @@ inline bool ProcessRequest(State& state, IUIAutomation* automation,
 
     GraphState current = GraphState::Ambiguous;
     IUIAutomationElement* timeline = nullptr;
-    if (!ResolveAndRead(automation, mainWindow, current, &timeline)) {
+    if (!ResolveAndRead(automation, mainWindow, current, &timeline, metrics)) {
         resultStatus = L"Visible AE Timeline or Graph Editor state is ambiguous";
         return false;
     }
@@ -360,18 +677,38 @@ inline bool ProcessRequest(State& state, IUIAutomation* automation,
                                       L"Layer bars are open";
         return true;
     }
+    // Resolve uniqueness once per generation. Focus and SendInput may mutate the
+    // subtree, so graph markers are still queried fresh at every proof point.
+    ElementReference requestTimeline(timeline);
     if (state.requestedGeneration.load(std::memory_order_acquire) != generation) {
         timeline->Release();
         resultStatus = L"Request superseded";
         return true;
     }
-    if (!WaitForModifiersReleased(state, generation)) {
+    bool modifiersReleased = false;
+    if (metrics) {
+        PerformanceTimer timer(metrics->modifierMs);
+        modifiersReleased = WaitForModifiersReleased(state, generation);
+    } else {
+        modifiersReleased = WaitForModifiersReleased(state, generation);
+    }
+    if (!modifiersReleased) {
         timeline->Release();
         resultStatus = L"Shortcut modifiers are held or request was superseded";
         return false;
     }
-    if (FAILED(timeline->SetFocus()) || !IsTimelineFocused(automation, timeline) ||
-        !ForegroundBelongsTo(mainWindow)) {
+    bool focusVerified = false;
+    if (metrics) {
+        PerformanceTimer timer(metrics->focusMs);
+        focusVerified = SUCCEEDED(timeline->SetFocus()) &&
+            IsTimelineFocused(automation, timeline) &&
+            ForegroundBelongsTo(mainWindow);
+    } else {
+        focusVerified = SUCCEEDED(timeline->SetFocus()) &&
+            IsTimelineFocused(automation, timeline) &&
+            ForegroundBelongsTo(mainWindow);
+    }
+    if (!focusVerified) {
         timeline->Release();
         resultStatus = L"AE Timeline focus could not be verified";
         return false;
@@ -384,26 +721,36 @@ inline bool ProcessRequest(State& state, IUIAutomation* automation,
     }
 
     // Focus may itself change the accessible tree; re-read before emitting input.
-    IUIAutomationElement* confirmedTimeline = nullptr;
-    if (!ResolveAndRead(automation, mainWindow, current, &confirmedTimeline)) {
+    current = ReadGraphStateMeasured(automation, requestTimeline.element, metrics);
+    if (current == GraphState::Ambiguous) {
         resultStatus = L"Graph Editor state became ambiguous after focus";
         return false;
     }
     if (current == desired) {
-        confirmedTimeline->Release();
         resultStatus = desiredGraph ? L"Graph Editor is open" :
-                                      L"Layer bars are open";
+                                       L"Layer bars are open";
         return true;
     }
-    const bool focusStillVerified =
-        IsTimelineFocused(automation, confirmedTimeline);
-    confirmedTimeline->Release();
-    if (!focusStillVerified || !ForegroundBelongsTo(mainWindow) ||
+    bool focusStillVerified = false;
+    if (metrics) {
+        PerformanceTimer timer(metrics->focusMs);
+        focusStillVerified = IsTimelineFocused(automation, requestTimeline.element);
+    } else {
+        focusStillVerified = IsTimelineFocused(automation, requestTimeline.element);
+    }
+    UIA_HWND timelineWindow = nullptr;
+    const bool targetForeground = SUCCEEDED(requestTimeline.element->get_CurrentNativeWindowHandle(&timelineWindow)) &&
+        SameProcessWindow(HWND(timelineWindow)) &&
+        GetAncestor(HWND(timelineWindow), GA_ROOT) == GetForegroundWindow();
+    if (!focusStillVerified || !targetForeground || !ForegroundBelongsTo(mainWindow) ||
+        state.stop.load(std::memory_order_acquire) ||
         state.requestedGeneration.load(std::memory_order_acquire) != generation ||
         !ModifiersReleased()) {
         resultStatus = L"Focus, foreground, request, or keyboard state changed before shortcut";
         return false;
     }
+    double unusedConfirmation = 0;
+    PerformanceTimer confirmationTimer(metrics ? metrics->confirmationMs : unusedConfirmation);
     if (!SendGraphShortcut()) {
         resultStatus = L"Shift+F3 could not be sent";
         return false;
@@ -420,11 +767,13 @@ inline bool ProcessRequest(State& state, IUIAutomation* automation,
             return true;
         }
         Sleep(40);
+        if (metrics) ++metrics->polls;
         if (!ForegroundBelongsTo(mainWindow)) {
             resultStatus = L"AE lost foreground ownership after shortcut";
             return false;
         }
-        if (ResolveAndRead(automation, mainWindow, current) && current == desired) {
+        current = ReadGraphStateMeasured(automation, requestTimeline.element, metrics);
+        if (current == desired) {
             resultStatus = desiredGraph ? L"Graph Editor opened" :
                                           L"Layer bars opened";
             return true;
@@ -467,16 +816,23 @@ inline DWORD WINAPI WorkerMain(void* context) {
         }
         std::wstring status;
         bool ok = false;
+        PerformanceMetrics performance;
+        const double requestStarted = PerformanceNowMs();
         if (automation) {
-            ok = ProcessRequest(state, automation, generation, mainWindow, desiredGraph, status);
+            ok = ProcessRequest(state, automation, generation, mainWindow,
+                                desiredGraph, status, &performance);
         } else {
             status = L"UI Automation worker is unavailable";
         }
+        performance.totalMs = PerformanceNowMs() - requestStarted;
+        const std::wstring performanceText =
+            FormatPerformance(performance, desiredGraph);
         {
             std::lock_guard<std::mutex> lock(state.statusMutex);
             if (generation == state.requestedGeneration.load(std::memory_order_acquire)) {
                 state.failed.store(!ok, std::memory_order_release);
                 state.status = status;
+                state.performance = performanceText;
             } else SetEvent(state.wakeEvent);
             // Outcome and completion belong to one generation. Queue uses the
             // same lock, so an older result cannot overwrite a newer request.
@@ -615,6 +971,12 @@ inline std::wstring Status() {
     detail::State& state = detail::GetState();
     std::lock_guard<std::mutex> lock(state.statusMutex);
     return state.status;
+}
+
+inline std::wstring PerformanceStatus() {
+    detail::State& state = detail::GetState();
+    std::lock_guard<std::mutex> lock(state.statusMutex);
+    return state.performance;
 }
 
 }  // namespace NativeGraphBridge

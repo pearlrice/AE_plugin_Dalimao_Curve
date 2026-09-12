@@ -463,6 +463,37 @@ void TestUnchangedComboDoesNotRebuild() {
     g_panel.hwnd = previous; g_comboContents = {};
 }
 
+void TestPopupWindowReuse() {
+    const HMODULE previousModule = g_module;
+    const HWND previousOwner = g_ae_main;
+    g_module = GetModuleHandleW(nullptr);
+    g_ae_main = CreateWindowExW(0, L"STATIC", L"AE test owner", WS_POPUP,
+        0, 0, 400, 400, nullptr, nullptr, g_module, nullptr);
+    g_popupOrigin = {100, 100};
+    CreateControls(false);
+    const HWND first = g_panel.hwnd;
+    const HWND slider = Control(OUT_SLIDER);
+    Check(IsWindow(first) && IsWindow(slider), "popup reuse fixture creates the actual hidden controls");
+    DismissControls();
+    Check(IsWindow(first) && !IsWindowVisible(first) && !s_panel_active,
+        "normal dismissal retains hidden popup without active UI state");
+    g_panel = {}; s_panel_active = true;
+    CreateControls(false);
+    Check(g_panel.hwnd == first && Control(OUT_SLIDER) == slider,
+        "reopening reuses the popup and its controls rather than rebuilding GDI windows");
+    DestroyWindow(first);
+    Check(!g_cachedPopup && !g_panel.hwnd, "external destruction invalidates cached and active handles");
+    CreateControls(false);
+    Check(IsWindow(g_panel.hwnd) && IsWindow(Control(OUT_SLIDER)),
+        "popup recovers after external window destruction");
+    const HWND last = g_panel.hwnd;
+    DestroyControls();
+    Check(!IsWindow(last) && !g_cachedPopup && !g_panel.hwnd,
+        "plugin shutdown releases both active and cached popup handles");
+    DestroyWindow(g_ae_main);
+    g_ae_main = previousOwner; g_module = previousModule;
+}
+
 std::string ReadBytes(const std::filesystem::path& path) {
     std::ifstream input(path, std::ios::binary);
     return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
@@ -531,6 +562,7 @@ int main() {
     TestAutomaticAnimatedProperty();
     TestQuiescentIdleDoesNoHostWork();
     TestUnchangedComboDoesNotRebuild();
+    TestPopupWindowReuse();
     TestPresetStorageWrapper();
     if (failures != 0) {
         std::cerr << failures << " integration test(s) failed\n";

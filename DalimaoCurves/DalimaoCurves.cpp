@@ -35,6 +35,8 @@ static HMODULE g_module = nullptr;
 static std::wstring g_plugin_dir;
 static bool s_panel_active = false;
 static POINT g_popupOrigin{};
+static HWND g_cachedPopup = nullptr;
+static ULONGLONG g_toggleStarted = 0;
 
 struct PropertyInfo {
     AEGP_StreamRefH streamH = nullptr;
@@ -378,22 +380,30 @@ static void ProcessAction(const Action& action) {
 
 #include "CurvePopupUI.inl"
 
-static void DestroyControls() {
+static void DismissControls() {
     g_pending = {};
-    if (g_panel.hwnd) DestroyWindow(g_panel.hwnd);
+    if (IsWindow(g_panel.hwnd)) ShowWindow(g_panel.hwnd, SW_HIDE);
     g_panel.hwnd = nullptr; s_panel_active = false;
-    popup_ui::Cleanup();
     g_closing = false; g_transition = false; g_closeAfterPending = false;
     g_displayKeys.clear(); g_displayProps.clear(); g_target = {};
+}
+static void DestroyControls() {
+    DismissControls();
+    if (g_cachedPopup) DestroyWindow(g_cachedPopup);
+    g_cachedPopup = nullptr;
+    popup_ui::Cleanup();
     g_comboContents = {};
 }
 static void ClosePanel() {
     if (g_closing) return;
     g_closing = true; g_transition = true;
+    g_toggleStarted = GetTickCount64();
+    // Hide immediately; keep controls allocated for the next invocation.
+    // If native confirmation fails, IdleHook restores the popup with the error.
+    ShowWindow(g_panel.hwnd, SW_HIDE);
     native_graph::Close();
     CurvesDebugLog(L"Shortcut close: requesting native layer bars");
     g_panel.presetStatus = L"正在返回 AE 图层滑条…";
-    UpdateControls();
 }
 static LRESULT CALLBACK KeyboardHook(int code, WPARAM wParam, LPARAM lParam) {
     if (code >= 0 && wParam == PM_REMOVE) {
@@ -418,6 +428,11 @@ static LRESULT CALLBACK KeyboardHook(int code, WPARAM wParam, LPARAM lParam) {
 }
 static LRESULT CALLBACK ControlsWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
+    case WM_NCDESTROY:
+        if (g_cachedPopup == hwnd) g_cachedPopup = nullptr;
+        if (g_panel.hwnd == hwnd) g_panel.hwnd = nullptr;
+        g_comboContents = {};
+        break;
     case WM_PAINT: popup_ui::Paint(hwnd); return 0;
     case WM_DPICHANGED: {
         RECT suggested = *reinterpret_cast<RECT*>(lParam);
@@ -471,7 +486,7 @@ static LRESULT CALLBACK ControlsWndProc(HWND hwnd, UINT message, WPARAM wParam, 
     }
     return DefWindowProcW(hwnd, message, wParam, lParam);
 }
-static void CreateControls() {
+static void CreateControls(bool show = true) {
     HMONITOR monitor = MonitorFromPoint(g_popupOrigin, MONITOR_DEFAULTTONEAREST);
     MONITORINFO info{ sizeof(info) };
     if (!GetMonitorInfoW(monitor, &info)) SystemParametersInfoW(SPI_GETWORKAREA, 0, &info.rcWork, 0);
@@ -479,18 +494,28 @@ static void CreateControls() {
     if (FAILED(GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &dpiX, &dpiY))) dpiX = GetDpiForWindow(g_ae_main);
     if (!dpiX) dpiX = 96;
     dpiX = popup_ui::FitDpi(info.rcWork, dpiX);
+    RECT bounds = popup_ui::CursorPlacement(g_popupOrigin, info.rcWork, dpiX);
+    if (g_cachedPopup && IsWindow(g_cachedPopup) && popup_ui::detail::g_dpi == dpiX &&
+        GetWindow(g_cachedPopup, GW_OWNER) == g_ae_main) {
+        g_panel.hwnd = g_cachedPopup;
+        SetWindowPos(g_panel.hwnd, nullptr, bounds.left, bounds.top, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        if (show) ShowWindow(g_panel.hwnd, SW_SHOWNOACTIVATE);
+        return;
+    }
+    if (g_cachedPopup) DestroyWindow(g_cachedPopup);
+    g_cachedPopup = nullptr; g_comboContents = {};
     popup_ui::Initialize(dpiX);
     INITCOMMONCONTROLSEX common{ sizeof(common), ICC_BAR_CLASSES }; InitCommonControlsEx(&common);
     WNDCLASSW wc{}; wc.hInstance = g_module; wc.lpfnWndProc = ControlsWndProc;
-    wc.lpszClassName = L"DalimaoCurveCursorPopup"; wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    wc.lpszClassName = native_graph::ControlsWindowClass; wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
     wc.style = CS_DROPSHADOW; RegisterClassW(&wc);
-    RECT bounds = popup_ui::CursorPlacement(g_popupOrigin, info.rcWork, dpiX);
     g_panel.hwnd = CreateWindowExW(WS_EX_TOOLWINDOW, wc.lpszClassName, L"Dalimao Curves · 鼠标浮窗",
         WS_POPUP | WS_CLIPCHILDREN, bounds.left, bounds.top, bounds.right - bounds.left, bounds.bottom - bounds.top,
         g_ae_main, nullptr, g_module, nullptr);
     if (!g_panel.hwnd) { popup_ui::Cleanup(); throw std::runtime_error("Unable to create cursor popup"); }
+    g_cachedPopup = g_panel.hwnd;
     popup_ui::CreateChildren(g_panel.hwnd);
-    ShowWindow(g_panel.hwnd, SW_SHOWNOACTIVATE);
+    if (show) ShowWindow(g_panel.hwnd, SW_SHOWNOACTIVATE);
     wchar_t placement[256]{};
     swprintf_s(placement, L"Cursor popup: origin=(%ld,%ld) bounds=(%ld,%ld,%ld,%ld) dpi=%u",
         g_popupOrigin.x, g_popupOrigin.y, bounds.left, bounds.top, bounds.right, bounds.bottom, dpiX);
@@ -525,17 +550,30 @@ static A_Err CommandHook(AEGP_GlobalRefcon, AEGP_CommandRefcon, AEGP_Command com
     *handled = TRUE;
     try {
         if (s_panel_active) { g_activationHeld = g_shortcut != 0; Queue(ActionKind::Close); return A_Err_NONE; }
+        g_toggleStarted = GetTickCount64();
         GetCursorPos(&g_popupOrigin);
         CaptureShortcut(); EnumWindows(FindAeWindow, LPARAM(&g_ae_main));
         if (g_shortcut == VK_F3 && g_shift && !g_ctrl && !g_alt) {
             MessageBoxW(g_ae_main, L"Shift+F3 用于 AE 原生曲线切换。请给 DalimaoCurves 分配其他快捷键，例如 4。", L"Dalimao Curves", MB_OK);
             return A_Err_NONE;
         }
-        if (!g_ae_main || !native_graph::Open(g_ae_main)) { CurvesDebugLog(native_graph::Status().c_str()); return A_Err_NONE; }
-        CurvesDebugLog(L"Shortcut open: requesting native Graph Editor; no custom graph");
+        if (!g_ae_main) return A_Err_NONE;
         g_panel = {}; s_panel_active = true; g_transition = true;
-        LoadPresetLibrary(); CreateControls();
+        const ULONGLONG loadStart = GetTickCount64();
+        LoadPresetLibrary();
+        const ULONGLONG createStart = GetTickCount64();
+        CreateControls(false);
+        const ULONGLONG selectionStart = GetTickCount64();
         Action initial; initial.kind = ActionKind::Refresh; ProcessAction(initial);
+        ReleaseHostData();
+        ShowWindow(g_panel.hwnd, SW_SHOWNOACTIVATE);
+        wchar_t timing[256]{};
+        swprintf_s(timing, L"Open UI timing: library=%llums controls=%llums selection=%llums main=%llums",
+            createStart - loadStart, selectionStart - createStart, GetTickCount64() - selectionStart, GetTickCount64() - g_toggleStarted);
+        CurvesDebugLog(timing);
+        // Start UIA only after the AE selection/control updates are finished.
+        if (!native_graph::Open(g_ae_main)) { g_transition = false; g_panel.presetStatus = native_graph::Status(); UpdateControls(); }
+        else CurvesDebugLog(L"Shortcut open: requesting native Graph Editor; no custom graph");
     } catch (...) { CurvesDebugLog(L"Native curve controls command failed"); native_graph::Close(); DestroyControls(); }
     try { ReleaseHostData(); } catch (...) { CurvesDebugLog(L"Host resource cleanup failed"); }
     return A_Err_NONE;
@@ -547,13 +585,25 @@ static A_Err IdleHook(AEGP_GlobalRefcon, AEGP_IdleRefcon, A_long* sleep) {
     if (g_transition || g_closing || g_pending.kind != ActionKind::None) *sleep = std::min<A_long>(*sleep, 6);
     if (g_transition && !native_graph::Busy()) {
         CurvesDebugLog(native_graph::Status().c_str());
+        CurvesDebugLog(native_graph::PerformanceStatus().c_str());
         g_transition = false;
         if (native_graph::Failed()) {
             g_closing = false;
             g_panel.presetStatus = L"原生面板切换未完成，请保持 AE 在前台后重试：" + native_graph::Status();
+            if (!IsWindow(g_panel.hwnd)) {
+                try { CreateControls(false); }
+                catch (...) { CurvesDebugLog(L"Popup recovery failed"); DestroyControls(); return A_Err_NONE; }
+            }
+            ShowWindow(g_panel.hwnd, SW_SHOWNOACTIVATE);
             CurvesDebugLog(g_panel.presetStatus.c_str()); UpdateControls();
-        } else if (g_closing) { DestroyControls(); return A_Err_NONE; }
-        else UpdateControls();
+        } else if (g_closing) {
+            wchar_t timing[128]{}; swprintf_s(timing, L"Close confirmed: %llums", GetTickCount64() - g_toggleStarted); CurvesDebugLog(timing);
+            DismissControls(); return A_Err_NONE;
+        }
+        else {
+            wchar_t timing[128]{}; swprintf_s(timing, L"Open confirmed: %llums", GetTickCount64() - g_toggleStarted); CurvesDebugLog(timing);
+            UpdateControls();
+        }
     }
     Action action = g_pending; g_pending = {};
     if (action.kind == ActionKind::None) return A_Err_NONE;
@@ -571,8 +621,7 @@ static A_Err UpdateMenuHook(AEGP_GlobalRefcon, AEGP_UpdateMenuRefcon, AEGP_Windo
 }
 static A_Err DeathHook(AEGP_GlobalRefcon, AEGP_DeathRefcon) {
     if (g_keyboardHook) UnhookWindowsHookEx(g_keyboardHook);
-    if (g_panel.hwnd) DestroyWindow(g_panel.hwnd);
-    popup_ui::Cleanup();
+    DestroyControls();
     native_graph::Shutdown(); return A_Err_NONE;
 }
 extern "C" DllExport A_Err EntryPointFunc(SPBasicSuite* basic, A_long, A_long,
