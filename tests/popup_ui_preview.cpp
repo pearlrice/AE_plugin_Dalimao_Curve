@@ -14,6 +14,8 @@
 #pragma comment(lib, "gdi32.lib")
 
 static HINSTANCE g_module = GetModuleHandleW(nullptr);
+#include "../DalimaoCurves/CurvePresetModel.h"
+static std::vector<curve_presets::Preset> g_userPresets = {curve_presets::Builtins()[2], curve_presets::Builtins()[5]};
 enum ControlId { PROP = 101, SEGMENT, DIMENSION, REFRESH, OUT_SLIDER, IN_SLIDER,
     OUT_LABEL, IN_LABEL, LIBRARY, SAVE, APPLY, DELETE_PRESET, RELOAD, STATUS, RETURN_LAYERS, PRESET = 200 };
 #include "../DalimaoCurves/CurvePopupUI.inl"

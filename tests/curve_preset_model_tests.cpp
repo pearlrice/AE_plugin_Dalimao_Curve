@@ -1,4 +1,5 @@
 #include "../DalimaoCurves/CurvePresetModel.h"
+#include "../DalimaoCurves/CurveThumbnail.h"
 
 #include <cmath>
 #include <iostream>
@@ -157,6 +158,33 @@ void TestSpatialLength() {
     Check(std::isnan(invalid), "nonfinite spatial input returns NaN");
 }
 
+void TestCurveThumbnails() {
+    const auto presets = curve_presets::Builtins();
+    for (const auto& preset : presets) {
+        const auto curve = curve_thumbnail::Sample(preset);
+        Check(curve.count == 49 && Near(curve.points[0].x, 0) && Near(curve.points[0].y, 0) &&
+            Near(curve.points[curve.count - 1].x, 1) && Near(curve.points[curve.count - 1].y, 1),
+            "preset thumbnail preserves normalized endpoints");
+        for (size_t i = 1; i < curve.count; ++i)
+            Check(curve.points[i].x >= curve.points[i - 1].x, "thumbnail time remains monotonic even with longest handles");
+    }
+    const auto linear = curve_thumbnail::Sample(presets[0]);
+    for (size_t i = 0; i < linear.count; ++i) Check(Near(linear.points[i].x, linear.points[i].y), "linear preset draws a diagonal");
+    const auto start = curve_thumbnail::MakeControlPoints(presets[2]);
+    const auto end = curve_thumbnail::MakeControlPoints(presets[3]);
+    Check(Near(start.p1.x, 1) && Near(start.p2.x, .999) && Near(end.p1.x, .001) && Near(end.p2.x, 0),
+        "asymmetric thumbnail uses actual 100 and 0.1 percent influences");
+    auto custom = presets[2]; custom.outSlope = 8;
+    auto curve = curve_thumbnail::Sample(custom, 999);
+    Check(curve.count == curve_thumbnail::kMaxSamples && curve.maxY > 1, "saved overshoot fits within bounded sample storage");
+    for (size_t i = 0; i < curve.count; ++i)
+        Check(curve.points[i].y >= curve.minY && curve.points[i].y <= curve.maxY, "saved curve bounds include all sampled overshoot");
+    custom.outType = curve_presets::Interpolation::Hold;
+    curve = curve_thumbnail::Sample(custom);
+    Check(curve.count == 3 && curve.points[1].x == 1 && curve.points[1].y == 0 && curve.points[2].y == 1,
+        "saved hold interpolation previews a step");
+}
+
 }  // namespace
 
 int main() {
@@ -165,6 +193,7 @@ int main() {
     TestDegenerateAndInvalidValues();
     TestPersistence();
     TestSpatialLength();
+    TestCurveThumbnails();
     if (failures != 0) {
         std::cerr << failures << " test(s) failed\n";
         return 1;

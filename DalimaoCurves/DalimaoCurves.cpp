@@ -124,7 +124,7 @@ static std::vector<KfInfo> g_displayKeys; // stream value handles are zeroed bef
 static int g_dimensions = 1;
 enum ControlId { PROP = 101, SEGMENT, DIMENSION, REFRESH, OUT_SLIDER, IN_SLIDER,
     OUT_LABEL, IN_LABEL, LIBRARY, SAVE, APPLY, DELETE_PRESET, RELOAD, STATUS, RETURN_LAYERS, PRESET = 200 };
-enum class ActionKind { None, Close, Refresh, Sync, Property, Segment, Dimension, Preset, Handles, Save, Apply, Delete, Reload };
+enum class ActionKind { None, Close, Refresh, Property, Segment, Dimension, Preset, Handles, Save, Apply, Delete, Reload };
 struct Action {
     ActionKind kind = ActionKind::None;
     Target target;
@@ -135,7 +135,6 @@ struct Action {
 };
 static Action g_pending;
 static bool g_closeAfterPending = false, g_closing = false, g_transition = false;
-static ULONGLONG g_lastSync = 0;
 static HHOOK g_keyboardHook = nullptr;
 static UINT g_shortcut = 0;
 static bool g_ctrl = false, g_alt = false, g_shift = false;
@@ -169,9 +168,9 @@ static void ReleaseHostData() {
     AEGP_SuiteHandler suites(g_sp);
     DisposeKeyframes(suites); g_kfs.clear(); DisposeProperties(suites);
 }
-static bool AcquireActive(Target& target, AEGP_CompH& comp) {
+static bool AcquireActive(Target& target, AEGP_CompH& comp, AEGP_LayerH& layer) {
     AEGP_SuiteHandler suites(g_sp);
-    AEGP_LayerH layer = nullptr; AEGP_ItemH item = nullptr;
+    AEGP_ItemH item = nullptr;
     if (suites.LayerSuite9()->AEGP_GetActiveLayer(&layer) || !layer ||
         suites.LayerSuite9()->AEGP_GetLayerParentComp(layer, &comp) || !comp ||
         suites.CompSuite11()->AEGP_GetItemFromComp(comp, &item) ||
@@ -180,7 +179,6 @@ static bool AcquireActive(Target& target, AEGP_CompH& comp) {
         g_panel.presetStatus = L"请在 AE 时间轴中选中一个带关键帧的图层，然后点击“读取 AE 选择”";
         return false;
     }
-    CollectProperties(suites, layer, g_props);
     return true;
 }
 static void ReadSelection(AEGP_CompH comp, int& property, int& segment) {
@@ -207,6 +205,11 @@ static void ReadSelection(AEGP_CompH comp, int& property, int& segment) {
         if (selectedKeys.size() == 2 && selectedKeys[1] == selectedKeys[0] + 1) segment = selectedKeys[0];
     }
 }
+static int ChooseAnimatedProperty(const std::vector<PropertyInfo>& properties, int selected) {
+    if (selected >= 0 && selected < int(properties.size()) && properties[selected].numKFs >= 2) return selected;
+    for (int i = 0; i < int(properties.size()); ++i) if (properties[i].numKFs >= 2) return i;
+    return -1;
+}
 static bool ShowNativeProperty(AEGP_CompH comp) {
     if (g_panel.curProp < 0) return false;
     AEGP_SuiteHandler suites(g_sp); AEGP_Collection2H selection = nullptr;
@@ -225,32 +228,53 @@ static bool ShowNativeProperty(AEGP_CompH comp) {
     return !error;
 }
 static void AddCombo(HWND control, const std::wstring& value) { SendMessageW(control, CB_ADDSTRING, 0, LPARAM(value.c_str())); }
+struct ComboContents { HWND hwnd = nullptr; std::vector<std::wstring> values; };
+static std::array<ComboContents, 4> g_comboContents;
+static void UpdateCombo(int id, std::vector<std::wstring> values, int selected) {
+    HWND hwnd = Control(id);
+    auto& cached = g_comboContents[id == PROP ? 0 : id == SEGMENT ? 1 : id == DIMENSION ? 2 : 3];
+    if (cached.hwnd != hwnd || cached.values != values || SendMessageW(hwnd, CB_GETCOUNT, 0, 0) != LRESULT(values.size())) {
+        SendMessageW(hwnd, WM_SETREDRAW, FALSE, 0);
+        SendMessageW(hwnd, CB_RESETCONTENT, 0, 0);
+        for (const auto& value : values) AddCombo(hwnd, value);
+        cached = { hwnd, std::move(values) };
+        SendMessageW(hwnd, WM_SETREDRAW, TRUE, 0);
+        InvalidateRect(hwnd, nullptr, FALSE);
+    }
+    if (SendMessageW(hwnd, CB_GETCURSEL, 0, 0) != selected) SendMessageW(hwnd, CB_SETCURSEL, selected, 0);
+}
+static void SetTextIfChanged(HWND hwnd, const wchar_t* text) {
+    int length = GetWindowTextLengthW(hwnd);
+    std::vector<wchar_t> old(static_cast<size_t>(length) + 1);
+    GetWindowTextW(hwnd, old.data(), length + 1);
+    if (wcscmp(old.data(), text)) SetWindowTextW(hwnd, text);
+}
 static void SliderLabels() {
     wchar_t label[120];
     swprintf_s(label, L"起点出手柄长度  %.1f%%", SendMessageW(Control(OUT_SLIDER), TBM_GETPOS, 0, 0) / 10.0);
-    SetWindowTextW(Control(OUT_LABEL), label);
+    SetTextIfChanged(Control(OUT_LABEL), label);
     swprintf_s(label, L"终点入手柄长度  %.1f%%", SendMessageW(Control(IN_SLIDER), TBM_GETPOS, 0, 0) / 10.0);
-    SetWindowTextW(Control(IN_LABEL), label);
+    SetTextIfChanged(Control(IN_LABEL), label);
 }
 static void UpdateControls() {
     if (!g_panel.hwnd) return;
     SetControlsBusy(false);
-    SendMessageW(Control(PROP), CB_RESETCONTENT, 0, 0);
-    for (const auto& p : g_displayProps) AddCombo(Control(PROP), p.name);
+    std::vector<std::wstring> names;
+    for (const auto& p : g_displayProps) names.push_back(p.name);
     int selected = -1;
     for (int i = 0; i < int(g_displayProps.size()); ++i) if (g_displayProps[i].id == g_target.stream) selected = i;
-    SendMessageW(Control(PROP), CB_SETCURSEL, selected, 0);
-    SendMessageW(Control(SEGMENT), CB_RESETCONTENT, 0, 0);
+    UpdateCombo(PROP, std::move(names), selected);
+    names.clear();
     for (int i = 0; i + 1 < int(g_displayKeys.size()); ++i) {
         wchar_t text[100]; swprintf_s(text, L"第 %d → %d 帧   %.3fs → %.3fs", i + 1, i + 2,
             g_displayKeys[i].time, g_displayKeys[i + 1].time);
-        AddCombo(Control(SEGMENT), text);
+        names.emplace_back(text);
     }
-    SendMessageW(Control(SEGMENT), CB_SETCURSEL, g_panel.presetSegment, 0);
-    SendMessageW(Control(DIMENSION), CB_RESETCONTENT, 0, 0);
+    UpdateCombo(SEGMENT, std::move(names), g_panel.presetSegment);
+    names.clear();
     const wchar_t* dims[] = { L"X / 数值", L"Y", L"Z" };
-    for (int i = 0; i < g_dimensions; ++i) AddCombo(Control(DIMENSION), g_dimensions == 1 ? L"数值 / 空间速度" : dims[i]);
-    SendMessageW(Control(DIMENSION), CB_SETCURSEL, g_panel.presetDim, 0);
+    for (int i = 0; i < g_dimensions; ++i) names.emplace_back(g_dimensions == 1 ? L"数值 / 空间速度" : dims[i]);
+    UpdateCombo(DIMENSION, std::move(names), g_panel.presetDim);
     bool pair = selected >= 0 && g_panel.presetSegment >= 0 && g_panel.presetSegment + 1 < int(g_displayKeys.size());
     if (pair) {
         const auto& a = g_displayKeys[g_panel.presetSegment]; const auto& b = g_displayKeys[g_panel.presetSegment + 1];
@@ -262,10 +286,11 @@ static void UpdateControls() {
     SliderLabels();
     for (int id : { OUT_SLIDER, IN_SLIDER, SAVE, APPLY }) EnableWindow(Control(id), pair);
     for (int i = 0; i < 6; ++i) EnableWindow(Control(PRESET + i), pair);
-    SendMessageW(Control(LIBRARY), CB_RESETCONTENT, 0, 0);
-    for (const auto& p : g_userPresets) AddCombo(Control(LIBRARY), std::wstring(p.name.begin(), p.name.end()));
-    SendMessageW(Control(LIBRARY), CB_SETCURSEL, g_panel.libraryIndex, 0);
-    SetWindowTextW(Control(STATUS), (g_panel.toast ? g_panel.toastMsg : g_panel.presetStatus).c_str());
+    names.clear();
+    for (const auto& p : g_userPresets) names.emplace_back(p.name.begin(), p.name.end());
+    UpdateCombo(LIBRARY, std::move(names), g_panel.libraryIndex);
+    InvalidateRect(Control(LIBRARY), nullptr, FALSE);
+    SetTextIfChanged(Control(STATUS), (g_panel.toast ? g_panel.toastMsg : g_panel.presetStatus).c_str());
     if (g_transition || g_closing) SetControlsBusy(true);
 }
 static void SnapshotDisplay() {
@@ -304,8 +329,8 @@ static void ProcessAction(const Action& action) {
         }
         UpdateControls(); return;
     }
-    Target current; AEGP_CompH comp = nullptr;
-    if (!AcquireActive(current, comp)) {
+    Target current; AEGP_CompH comp = nullptr; AEGP_LayerH layer = nullptr;
+    if (!AcquireActive(current, comp, layer)) {
         g_target = {}; g_displayProps.clear(); g_displayKeys.clear(); UpdateControls(); return;
     }
     const bool refresh = action.kind == ActionKind::Refresh;
@@ -313,7 +338,10 @@ static void ProcessAction(const Action& action) {
         g_panel.presetStatus = L"AE 中的图层或合成已改变，未修改。请点击“读取 AE 选择”";
         UpdateControls(); return;
     }
+    AEGP_SuiteHandler suites(g_sp);
+    CollectProperties(suites, layer, g_props);
     int property = -1;
+    bool autoSelected = false;
     int32_t id = action.target.stream;
     if (action.kind == ActionKind::Property && action.index >= 0 && action.index < int(g_displayProps.size())) id = g_displayProps[action.index].id;
     for (int i = 0; i < int(g_props.size()); ++i) if (g_props[i].id == id) property = i;
@@ -321,19 +349,23 @@ static void ProcessAction(const Action& action) {
     if (refresh) {
         property = -1; g_panel.presetSegment = 0; g_panel.presetDim = 0;
         ReadSelection(comp, property, g_panel.presetSegment);
-        if (property < 0 && g_props.size() == 1) property = 0;
-        g_panel.presetStatus = property < 0 ? L"请选择上方要编辑的属性；多个属性不会自动批量修改" : L"已读取 AE 选择。可使用预设按钮或拖动手柄长度滑块";
+        const int selected = property;
+        property = ChooseAnimatedProperty(g_props, property);
+        autoSelected = property >= 0 && property != selected;
+        if (property != selected) g_panel.presetSegment = 0;
+        g_panel.presetStatus = property < 0 ? L"当前图层没有至少两个关键帧的可编辑数值属性" :
+            selected == property ? L"已读取选中属性，可点击曲线预设或调整手柄" : L"已自动选择带关键帧的属性，可在下拉框切换其他属性";
     }
     g_target = current; g_panel.curProp = property;
     ReloadKeyframes();
     if (g_panel.curProp >= 0) {
-        if (action.kind == ActionKind::Property) {
-            g_panel.presetSegment = 0; g_panel.presetDim = 0;
-            g_panel.presetStatus = ShowNativeProperty(comp) ? L"已选中 AE 中对应属性，可直接查看原生曲线" : L"已读取属性；AE 未接受界面选择，请在时间轴中点选该属性";
+        if (autoSelected || action.kind == ActionKind::Property) {
+            if (!refresh) { g_panel.presetSegment = 0; g_panel.presetDim = 0; }
+            if (!ShowNativeProperty(comp)) g_panel.presetStatus = L"已读取属性；AE 未接受界面选择，请在时间轴中点选该属性";
         }
         else if (action.kind == ActionKind::Segment) g_panel.presetSegment = action.index;
         else if (action.kind == ActionKind::Dimension) g_panel.presetDim = action.index;
-        else if (!refresh && action.kind != ActionKind::Sync) {
+        else if (!refresh) {
             if (!PairUnchanged(action)) g_panel.presetStatus = L"关键帧已在 AE 中改变，本次未修改；已刷新，请再次操作";
             else if (action.kind == ActionKind::Preset && action.index >= 0 && action.index < 6) ApplySegmentPreset(curve_presets::Builtins()[action.index]);
             else if (action.kind == ActionKind::Handles) ApplyHandleInfluences(action.out, action.in);
@@ -353,6 +385,7 @@ static void DestroyControls() {
     popup_ui::Cleanup();
     g_closing = false; g_transition = false; g_closeAfterPending = false;
     g_displayKeys.clear(); g_displayProps.clear(); g_target = {};
+    g_comboContents = {};
 }
 static void ClosePanel() {
     if (g_closing) return;
@@ -386,8 +419,13 @@ static LRESULT CALLBACK KeyboardHook(int code, WPARAM wParam, LPARAM lParam) {
 static LRESULT CALLBACK ControlsWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
     case WM_PAINT: popup_ui::Paint(hwnd); return 0;
-    case WM_DPICHANGED:
-        popup_ui::ChangeDpi(hwnd, HIWORD(wParam), *reinterpret_cast<RECT*>(lParam)); return 0;
+    case WM_DPICHANGED: {
+        RECT suggested = *reinterpret_cast<RECT*>(lParam);
+        MONITORINFO monitor{ sizeof(monitor) };
+        GetMonitorInfoW(MonitorFromRect(&suggested, MONITOR_DEFAULTTONEAREST), &monitor);
+        UINT dpi = popup_ui::FitDpi(monitor.rcWork, HIWORD(wParam));
+        popup_ui::ChangeDpi(hwnd, dpi, suggested); return 0;
+    }
     case WM_ERASEBKGND: return 1;
     case WM_DRAWITEM:
         if (popup_ui::DrawItem(reinterpret_cast<const DRAWITEMSTRUCT*>(lParam))) return TRUE;
@@ -440,6 +478,7 @@ static void CreateControls() {
     UINT dpiX = 96, dpiY = 96;
     if (FAILED(GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &dpiX, &dpiY))) dpiX = GetDpiForWindow(g_ae_main);
     if (!dpiX) dpiX = 96;
+    dpiX = popup_ui::FitDpi(info.rcWork, dpiX);
     popup_ui::Initialize(dpiX);
     INITCOMMONCONTROLSEX common{ sizeof(common), ICC_BAR_CLASSES }; InitCommonControlsEx(&common);
     WNDCLASSW wc{}; wc.hInstance = g_module; wc.lpfnWndProc = ControlsWndProc;
@@ -503,7 +542,9 @@ static A_Err CommandHook(AEGP_GlobalRefcon, AEGP_CommandRefcon, AEGP_Command com
 }
 static A_Err IdleHook(AEGP_GlobalRefcon, AEGP_IdleRefcon, A_long* sleep) {
     if (!s_panel_active) return A_Err_NONE;
-    *sleep = std::min<A_long>(*sleep, 6);
+    // No passive tree scans or redraws. Only queued user work/bridge completion
+    // needs a short idle interval; ordinary AE editing keeps its normal cadence.
+    if (g_transition || g_closing || g_pending.kind != ActionKind::None) *sleep = std::min<A_long>(*sleep, 6);
     if (g_transition && !native_graph::Busy()) {
         CurvesDebugLog(native_graph::Status().c_str());
         g_transition = false;
@@ -515,12 +556,6 @@ static A_Err IdleHook(AEGP_GlobalRefcon, AEGP_IdleRefcon, A_long* sleep) {
         else UpdateControls();
     }
     Action action = g_pending; g_pending = {};
-    if (action.kind == ActionKind::None && !g_transition && !g_closing &&
-        GetTickCount64() - g_lastSync > 500 && GetForegroundWindow() != g_panel.hwnd) {
-        g_lastSync = GetTickCount64();
-        action.kind = ActionKind::Sync; action.target = g_target;
-        action.segment = g_panel.presetSegment; action.dim = g_panel.presetDim;
-    }
     if (action.kind == ActionKind::None) return A_Err_NONE;
     try {
         if (action.kind == ActionKind::Close) ClosePanel();

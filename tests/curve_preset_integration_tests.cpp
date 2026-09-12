@@ -41,6 +41,7 @@ AEGP_StreamSuite6 streamSuite{};
 AEGP_UtilitySuite6 utilitySuite{};
 SPBasicSuite basicSuite{};
 int failures = 0;
+int suiteAcquisitions = 0;
 
 void Check(bool condition, const char* description) {
     if (!condition) {
@@ -183,6 +184,7 @@ A_Err SPAPI EndUndoGroup() {
 }
 
 SPErr SPAPI AcquireSuite(const char* name, int32 version, const void** suite) {
+    ++suiteAcquisitions;
     if (std::strcmp(name, kAEGPKeyframeSuite) == 0 && version == kAEGPKeyframeSuiteVersion5) {
         *suite = &keyframeSuite;
     } else if (std::strcmp(name, kAEGPStreamSuite) == 0 && version == kAEGPStreamSuiteVersion6) {
@@ -410,6 +412,57 @@ void TestClosePreservesQueuedEdit() {
     g_pending = {}; g_closeAfterPending = false; g_displayKeys.clear();
 }
 
+void TestAutomaticAnimatedProperty() {
+    std::vector<PropertyInfo> properties(4);
+    properties[0].numKFs = 1;
+    properties[1].numKFs = 6;
+    properties[2].numKFs = 0;
+    properties[3].numKFs = 2;
+    Check(ChooseAnimatedProperty(properties, -1) == 1, "no property selection automatically finds first two-key property");
+    Check(ChooseAnimatedProperty(properties, 3) == 3, "explicit eligible property selection takes priority");
+    Check(ChooseAnimatedProperty(properties, 0) == 1, "single-key selection falls back to an editable segment");
+    Check(ChooseAnimatedProperty(properties, 99) == 1, "invalid selection index cannot escape property bounds");
+    properties[1].numKFs = 1; properties[3].numKFs = 1;
+    Check(ChooseAnimatedProperty(properties, -1) == -1, "no two-key property leaves editing disabled");
+    Check(ChooseAnimatedProperty({}, -1) == -1, "empty layer cannot select a nonexistent property");
+}
+
+void TestQuiescentIdleDoesNoHostWork() {
+    s_panel_active = true; g_transition = false; g_closing = false;
+    g_pending = {}; g_closeAfterPending = false;
+    const int before = suiteAcquisitions;
+    for (int i = 0; i < 10000; ++i) {
+        A_long sleep = 500;
+        Check(IdleHook(nullptr, nullptr, &sleep) == A_Err_NONE && sleep == 500,
+            "quiescent popup keeps AE idle interval and returns without work");
+    }
+    Check(suiteAcquisitions == before, "10000 quiescent idle calls perform zero AE suite acquisitions/scans");
+    s_panel_active = false;
+}
+
+int comboResets = 0, comboSelections = 0;
+LRESULT CALLBACK CountComboUpdates(HWND hwnd, UINT message, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR) {
+    if (message == CB_RESETCONTENT) ++comboResets;
+    if (message == CB_SETCURSEL) ++comboSelections;
+    return DefSubclassProc(hwnd, message, wp, lp);
+}
+void TestUnchangedComboDoesNotRebuild() {
+    HWND parent = CreateWindowExW(0, L"STATIC", L"", WS_POPUP, 0, 0, 300, 200, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    HWND combo = CreateWindowExW(0, L"COMBOBOX", L"", WS_CHILD | CBS_DROPDOWNLIST,
+        0, 0, 200, 100, parent, HMENU(PROP), GetModuleHandleW(nullptr), nullptr);
+    Check(parent && combo, "combo regression fixture creates Win32 controls");
+    if (!parent || !combo) { if (parent) DestroyWindow(parent); return; }
+    HWND previous = g_panel.hwnd; g_panel.hwnd = parent;
+    g_comboContents = {}; comboResets = comboSelections = 0;
+    SetWindowSubclass(combo, CountComboUpdates, 1, 0);
+    for (int i = 0; i < 100; ++i) UpdateCombo(PROP, {L"Opacity", L"Position"}, 1);
+    Check(comboResets == 1 && comboSelections == 1, "100 unchanged updates rebuild/select the combo only once");
+    UpdateCombo(PROP, {L"Opacity", L"Scale"}, 0);
+    Check(comboResets == 2 && comboSelections == 2, "changed contents still refresh the control");
+    RemoveWindowSubclass(combo, CountComboUpdates, 1); DestroyWindow(parent);
+    g_panel.hwnd = previous; g_comboContents = {};
+}
+
 std::string ReadBytes(const std::filesystem::path& path) {
     std::ifstream input(path, std::ios::binary);
     return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
@@ -475,6 +528,9 @@ int main() {
     TestHandleSliders();
     TestStaleQueuedPair();
     TestClosePreservesQueuedEdit();
+    TestAutomaticAnimatedProperty();
+    TestQuiescentIdleDoesNoHostWork();
+    TestUnchangedComboDoesNotRebuild();
     TestPresetStorageWrapper();
     if (failures != 0) {
         std::cerr << failures << " integration test(s) failed\n";

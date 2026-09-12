@@ -1,5 +1,7 @@
 #pragma once
 
+#include "CurveThumbnail.h"
+
 // Compact, DPI-aware Win32 presentation for the native curve controls popup.
 // This file deliberately contains no After Effects SDK calls so it can also be
 // included by the standalone preview harness.
@@ -7,7 +9,7 @@ namespace popup_ui {
 
 namespace detail {
 constexpr int kLogicalWidth = 448;
-constexpr int kLogicalHeight = 508;
+constexpr int kLogicalHeight = 618;
 
 UINT g_dpi = 96;
 HFONT g_uiFont = nullptr;
@@ -118,14 +120,79 @@ const wchar_t* ComboPlaceholder(int id) {
     }
 }
 
+void DrawCurveThumbnail(HDC dc, RECT rect, const curve_presets::Preset& preset, COLORREF color) {
+    if (rect.right - rect.left < Scale(12) || rect.bottom - rect.top < Scale(12)) return;
+    const auto samples = curve_thumbnail::Sample(preset, 49);
+    if (samples.count < 2) return;
+
+    HPEN guidePen = CreatePen(PS_SOLID, 1, RGB(57, 61, 69));
+    HGDIOBJ oldPen = SelectObject(dc, guidePen);
+    const int middleX = (rect.left + rect.right) / 2;
+    const int middleY = (rect.top + rect.bottom) / 2;
+    MoveToEx(dc, rect.left, middleY, nullptr);
+    LineTo(dc, rect.right, middleY);
+    MoveToEx(dc, middleX, rect.top, nullptr);
+    LineTo(dc, middleX, rect.bottom);
+    SelectObject(dc, oldPen);
+    DeleteObject(guidePen);
+
+    const double range = std::max(0.001, samples.maxY - samples.minY);
+    const double padding = std::max(0.04, range * 0.08);
+    const double minY = samples.minY - padding;
+    const double maxY = samples.maxY + padding;
+    const double visibleRange = maxY - minY;
+    std::array<POINT, curve_thumbnail::kMaxSamples> points{};
+    for (std::size_t index = 0; index < samples.count; ++index) {
+        const auto& point = samples.points[index];
+        points[index].x = rect.left + static_cast<LONG>(std::lround(
+            point.x * static_cast<double>(rect.right - rect.left - 1)));
+        points[index].y = rect.bottom - 1 - static_cast<LONG>(std::lround(
+            (point.y - minY) / visibleRange * static_cast<double>(rect.bottom - rect.top - 1)));
+    }
+
+    int saved = SaveDC(dc);
+    IntersectClipRect(dc, rect.left, rect.top, rect.right, rect.bottom);
+    HPEN curvePen = CreatePen(PS_SOLID, std::max(1, Scale(2)), color);
+    oldPen = SelectObject(dc, curvePen);
+    Polyline(dc, points.data(), static_cast<int>(samples.count));
+    SelectObject(dc, oldPen);
+    DeleteObject(curvePen);
+    RestoreDC(dc, saved);
+}
+
+const curve_presets::Preset* BuiltinPreset(int id) {
+    static const std::vector<curve_presets::Preset> presets = curve_presets::Builtins();
+    const int index = id - PRESET;
+    return index >= 0 && index < static_cast<int>(presets.size()) ? &presets[index] : nullptr;
+}
+
+const curve_presets::Preset* UserPreset(int index) {
+    return index >= 0 && index < static_cast<int>(g_userPresets.size()) ? &g_userPresets[index] : nullptr;
+}
+
 void PaintCombo(HWND hwnd, HDC dc) {
     RECT rect{}; GetClientRect(hwnd, &rect);
     FillSolid(dc, rect, kCard);
     RoundBox(dc, rect, kControl, GetFocus() == hwnd ? kAccent : kBorder, 5);
+    const int id = GetDlgCtrlID(hwnd);
+    const int selected = static_cast<int>(SendMessageW(hwnd, CB_GETCURSEL, 0, 0));
     std::wstring text = ItemText(hwnd, UINT(-1));
-    if (text.empty()) text = ComboPlaceholder(GetDlgCtrlID(hwnd));
-    RECT label = rect; label.left += Scale(8); label.right -= Scale(24);
-    Text(dc, text.c_str(), label, IsWindowEnabled(hwnd) ? kText : kDisabled,
+    const bool hasText = !text.empty();
+    if (!hasText) text = ComboPlaceholder(id);
+    RECT label = rect;
+    label.left += Scale(8);
+    label.right -= Scale(24);
+    if (id == LIBRARY && hasText) {
+        if (const auto* preset = UserPreset(selected)) {
+            RECT graph = label;
+            graph.right = std::min(label.right, graph.left + Scale(78));
+            graph.top += Scale(4);
+            graph.bottom -= Scale(4);
+            DrawCurveThumbnail(dc, graph, *preset, IsWindowEnabled(hwnd) ? kAccent : kDisabled);
+            label.left = graph.right + Scale(10);
+        }
+    }
+    Text(dc, text.c_str(), label, !hasText ? kMuted : IsWindowEnabled(hwnd) ? kText : kDisabled,
         DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX, g_uiFont);
     const int x = rect.right - Scale(13), y = (rect.top + rect.bottom) / 2;
     HPEN pen = CreatePen(PS_SOLID, Scale(1), kMuted);
@@ -148,15 +215,6 @@ LRESULT CALLBACK ComboProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp, UINT_P
     return result;
 }
 
-const wchar_t* PresetHint(int id) {
-    static const wchar_t* hints[] = {
-        L"LINEAR", L"OUT 33.3  ·  IN 33.3", L"OUT 100  ·  IN 0.1",
-        L"OUT 0.1  ·  IN 100", L"OUT 66.7  ·  IN 66.7", L"OUT 100  ·  IN 100"
-    };
-    int index = id - PRESET;
-    return index >= 0 && index < 6 ? hints[index] : L"";
-}
-
 } // namespace detail
 
 SIZE SizeAtDpi(UINT dpi) {
@@ -169,7 +227,14 @@ int HeaderHeight() {
     return detail::Scale(48);
 }
 
+UINT FitDpi(RECT work, UINT dpi) {
+    const int available = std::min(int((int64_t(work.right) - work.left) * 96 / detail::kLogicalWidth),
+        int((int64_t(work.bottom) - work.top) * 96 / detail::kLogicalHeight));
+    return std::min(dpi ? dpi : 96U, static_cast<UINT>(std::max(1, available)));
+}
+
 RECT CursorPlacement(POINT cursor, RECT work, UINT dpi) {
+    dpi = FitDpi(work, dpi);
     SIZE size = SizeAtDpi(dpi);
     int gap = MulDiv(14, static_cast<int>(dpi ? dpi : 96), 96);
     const int cursorX = static_cast<int>(cursor.x);
@@ -232,17 +297,17 @@ void CreateChildren(HWND parent) {
     };
     for (int i = 0; i < 6; ++i) {
         Add(parent, L"BUTTON", presetNames[i], PRESET + i,
-            20 + (i % 3) * 136, 190 + (i / 3) * 36, 128, 34, BS_OWNERDRAW | WS_TABSTOP);
+            20 + (i % 3) * 136, 190 + (i / 3) * 64, 128, 58, BS_OWNERDRAW | WS_TABSTOP);
     }
 
     HWND outLabel = Add(parent, L"STATIC", L"起点出手柄长度  33.3%", OUT_LABEL,
-        20, 299, 400, 17, SS_LEFT | SS_CENTERIMAGE);
+        20, 355, 400, 17, SS_LEFT | SS_CENTERIMAGE);
     HWND outSlider = Add(parent, TRACKBAR_CLASSW, L"", OUT_SLIDER,
-        20, 316, 400, 20, TBS_HORZ | TBS_NOTICKS | WS_TABSTOP);
+        20, 372, 400, 20, TBS_HORZ | TBS_NOTICKS | WS_TABSTOP);
     HWND inLabel = Add(parent, L"STATIC", L"终点入手柄长度  33.3%", IN_LABEL,
-        20, 338, 400, 17, SS_LEFT | SS_CENTERIMAGE);
+        20, 394, 400, 17, SS_LEFT | SS_CENTERIMAGE);
     HWND inSlider = Add(parent, TRACKBAR_CLASSW, L"", IN_SLIDER,
-        20, 355, 400, 20, TBS_HORZ | TBS_NOTICKS | WS_TABSTOP);
+        20, 411, 400, 20, TBS_HORZ | TBS_NOTICKS | WS_TABSTOP);
     SetChildFont(outLabel, g_uiFontStrong);
     SetChildFont(inLabel, g_uiFontStrong);
     for (HWND slider : { outSlider, inSlider }) {
@@ -250,18 +315,19 @@ void CreateChildren(HWND parent) {
         SendMessageW(slider, TBM_SETPAGESIZE, 0, 100);
     }
 
-    Add(parent, L"COMBOBOX", L"", LIBRARY, 20, 402, 148, 180,
+    Add(parent, L"COMBOBOX", L"", LIBRARY, 20, 470, 400, 260,
         CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_VSCROLL | WS_TABSTOP);
-    Add(parent, L"BUTTON", L"保存", SAVE, 174, 402, 56, 26, BS_OWNERDRAW | WS_TABSTOP);
-    Add(parent, L"BUTTON", L"应用", APPLY, 236, 402, 56, 26, BS_OWNERDRAW | WS_TABSTOP);
-    Add(parent, L"BUTTON", L"删除", DELETE_PRESET, 298, 402, 54, 26, BS_OWNERDRAW | WS_TABSTOP);
-    Add(parent, L"BUTTON", L"重载", RELOAD, 358, 402, 62, 26, BS_OWNERDRAW | WS_TABSTOP);
-    HWND status = Add(parent, L"STATIC", L"", STATUS, 20, 440, 400, 56,
+    Add(parent, L"BUTTON", L"保存", SAVE, 20, 510, 94, 28, BS_OWNERDRAW | WS_TABSTOP);
+    Add(parent, L"BUTTON", L"应用", APPLY, 122, 510, 94, 28, BS_OWNERDRAW | WS_TABSTOP);
+    Add(parent, L"BUTTON", L"删除", DELETE_PRESET, 224, 510, 94, 28, BS_OWNERDRAW | WS_TABSTOP);
+    Add(parent, L"BUTTON", L"重载", RELOAD, 326, 510, 94, 28, BS_OWNERDRAW | WS_TABSTOP);
+    HWND status = Add(parent, L"STATIC", L"", STATUS, 20, 550, 400, 56,
         SS_LEFT | SS_NOPREFIX);
     SetChildFont(status, g_uiFontSmall);
     for (int id : { PROP, SEGMENT, DIMENSION, LIBRARY }) {
         HWND combo = GetDlgItem(parent, id);
-        SendMessageW(combo, CB_SETITEMHEIGHT, WPARAM(-1), Scale(24));
+        SendMessageW(combo, CB_SETITEMHEIGHT, WPARAM(-1), Scale(id == LIBRARY ? 34 : 24));
+        SendMessageW(combo, CB_SETITEMHEIGHT, 0, Scale(id == LIBRARY ? 48 : 24));
         SetWindowSubclass(combo, ComboProc, 1, 0);
     }
 }
@@ -291,8 +357,8 @@ void ChangeDpi(HWND parent, UINT dpi, RECT suggested) {
         SetChildFont(child.hwnd, id == STATUS ? g_uiFontSmall :
             (id == OUT_LABEL || id == IN_LABEL) ? g_uiFontStrong : g_uiFont);
         if (id == PROP || id == SEGMENT || id == DIMENSION || id == LIBRARY) {
-            SendMessageW(child.hwnd, CB_SETITEMHEIGHT, WPARAM(-1), Scale(24));
-            SendMessageW(child.hwnd, CB_SETITEMHEIGHT, 0, Scale(24));
+            SendMessageW(child.hwnd, CB_SETITEMHEIGHT, WPARAM(-1), Scale(id == LIBRARY ? 34 : 24));
+            SendMessageW(child.hwnd, CB_SETITEMHEIGHT, 0, Scale(id == LIBRARY ? 48 : 24));
         }
         MoveWindow(child.hwnd, MulDiv(r.left, g_dpi, oldDpi), MulDiv(r.top, g_dpi, oldDpi),
             MulDiv(r.right - r.left, g_dpi, oldDpi), MulDiv(r.bottom - r.top, g_dpi, oldDpi), TRUE);
@@ -318,14 +384,14 @@ void PaintContent(HDC dc, RECT client) {
     RoundBox(dc, ScaledRect(12, 52, 436, 156), kCard, kBorder, 8);
     Text(dc, L"SELECTION  ·  AE 选择", ScaledRect(20, 62, 340, 92), kMuted,
         DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX, g_uiFontSmall);
-    RoundBox(dc, ScaledRect(12, 164, 436, 270), kCard, kBorder, 8);
+    RoundBox(dc, ScaledRect(12, 164, 436, 320), kCard, kBorder, 8);
     Text(dc, L"EASING PRESETS  ·  缓动预设", ScaledRect(20, 169, 420, 188), kMuted,
         DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX, g_uiFontSmall);
-    RoundBox(dc, ScaledRect(12, 278, 436, 384), kCard, kBorder, 8);
-    Text(dc, L"HANDLE INFLUENCE  ·  手柄长度", ScaledRect(20, 280, 420, 298), kMuted,
+    RoundBox(dc, ScaledRect(12, 328, 436, 438), kCard, kBorder, 8);
+    Text(dc, L"HANDLE INFLUENCE  ·  手柄长度", ScaledRect(20, 334, 420, 353), kMuted,
         DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX, g_uiFontSmall);
-    RoundBox(dc, ScaledRect(12, 386, 436, 434), kCard, kBorder, 8);
-    Text(dc, L"MY TEMPLATES", ScaledRect(20, 387, 180, 402), kMuted,
+    RoundBox(dc, ScaledRect(12, 446, 436, 546), kCard, kBorder, 8);
+    Text(dc, L"MY TEMPLATES  ·  已保存模板", ScaledRect(20, 450, 320, 468), kMuted,
         DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX, g_uiFontSmall);
 }
 
@@ -356,6 +422,17 @@ bool DrawItem(const DRAWITEMSTRUCT* item) {
         if (value.empty()) { value = ComboPlaceholder(id); color = kMuted; }
         rect.left += Scale(9);
         rect.right -= Scale(19);
+        if (id == LIBRARY && item->itemID != UINT(-1)) {
+            if (const auto* preset = UserPreset(static_cast<int>(item->itemID))) {
+                RECT graph = rect;
+                graph.right = std::min(rect.right, graph.left + Scale(82));
+                graph.top += Scale(4);
+                graph.bottom -= Scale(4);
+                DrawCurveThumbnail(item->hDC, graph, *preset,
+                    (item->itemState & ODS_DISABLED) ? kDisabled : kAccent);
+                rect.left = graph.right + Scale(10);
+            }
+        }
         Text(item->hDC, value.c_str(), rect, color,
             DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX, g_uiFont);
         if (item->itemState & ODS_COMBOBOXEDIT) {
@@ -389,16 +466,19 @@ bool DrawItem(const DRAWITEMSTRUCT* item) {
     GetWindowTextW(item->hwndItem, title, static_cast<int>(std::size(title)));
     COLORREF foreground = disabled ? kDisabled : (close ? kMuted : kText);
     if (preset) {
-        RECT top = rect;
-        top.bottom = top.top + Scale(17);
-        top.left += Scale(7);
-        Text(item->hDC, title, top, foreground,
-            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX, g_uiFontSmall);
-        RECT bottom = rect;
-        bottom.top += Scale(17);
-        bottom.left += Scale(7);
-        Text(item->hDC, PresetHint(id), bottom, disabled ? kDisabled : kMuted,
-            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX, g_uiFontSmall);
+        RECT graph = rect;
+        graph.left += Scale(8);
+        graph.right -= Scale(8);
+        graph.top += Scale(5);
+        graph.bottom -= Scale(18);
+        if (const auto* builtin = BuiltinPreset(id))
+            DrawCurveThumbnail(item->hDC, graph, *builtin, disabled ? kDisabled : kAccent);
+        RECT label = rect;
+        label.top = label.bottom - Scale(18);
+        label.left += Scale(6);
+        label.right -= Scale(6);
+        Text(item->hDC, title, label, foreground,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX, g_uiFontSmall);
     } else {
         Text(item->hDC, title, rect, foreground,
             DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX, close ? g_uiFontStrong : g_uiFont);
@@ -413,7 +493,7 @@ bool DrawItem(const DRAWITEMSTRUCT* item) {
 
 bool MeasureItem(MEASUREITEMSTRUCT* item) {
     if (!item || item->CtlType != ODT_COMBOBOX) return false;
-    item->itemHeight = static_cast<UINT>(detail::Scale(24));
+    item->itemHeight = static_cast<UINT>(detail::Scale(item->CtlID == LIBRARY ? 48 : 24));
     return true;
 }
 
