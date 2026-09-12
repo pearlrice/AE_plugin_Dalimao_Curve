@@ -249,7 +249,6 @@ void ResetFixture() {
     };
     g_sp = &basicSuite;
     g_plugin_id = 7;
-    g_tl_hwnd = nullptr;
     g_plugin_dir.clear();
     g_props.clear();
     PropertyInfo property;
@@ -362,6 +361,55 @@ void TestRefreshFailureAfterWrite() {
     Check(g_panel.curProp == -1 && g_kfs.empty(), "refresh failure invalidates stale panel keyframe state");
 }
 
+void TestHandleSliders() {
+    ResetFixture();
+    fake.keys[1].value[1] = fake.keys[0].value[1];
+    ReloadKeyframes();
+    const auto original = fake.keys;
+    ApplyHandleInfluences(100.0, 0.1);
+    Check(Near(fake.keys[0].out[1].influenceF, 1.0) && Near(fake.keys[1].in[1].influenceF, .001),
+        "sliders use the entire supported influence range");
+    Check(fake.keys[0].out[1].speedF == original[0].out[1].speedF &&
+        fake.keys[1].in[1].speedF == original[1].in[1].speedF,
+        "sliders preserve nonzero speeds even when endpoint values are equal");
+    Check(SameEase(fake.keys[0].in[1], original[0].in[1]) && SameEase(fake.keys[1].out[1], original[1].out[1]) &&
+        SameEase(fake.keys[0].out[0], original[0].out[0]) && SameEase(fake.keys[1].in[0], original[1].in[0]),
+        "sliders preserve opposite sides and nonselected dimensions");
+    Check(fake.startUndo == 1 && fake.endUndo == 1, "slider gesture commits one balanced undo group");
+    ResetFixture();
+    ApplyHandleInfluences(0, 50);
+    Check(fake.writes == 0 && fake.startUndo == 0, "out-of-range slider influence cannot write");
+}
+
+void TestStaleQueuedPair() {
+    ResetFixture();
+    Action action; action.hasPair = true; action.segment = 0;
+    action.keys = {g_kfs[0], g_kfs[1]};
+    Check(PairUnchanged(action), "unchanged queued pair is accepted");
+    fake.keys[0].out[1].speedF += 1; ReloadKeyframes();
+    Check(!PairUnchanged(action), "native AE speed edit invalidates queued operation");
+    ResetFixture(); action.keys = {g_kfs[0], g_kfs[1]};
+    fake.keys[1].compTime += .1; ReloadKeyframes();
+    Check(!PairUnchanged(action), "moved endpoint invalidates queued operation");
+    ResetFixture(); action.keys = {g_kfs[0], g_kfs[1]};
+    fake.keys.erase(fake.keys.begin()); ReloadKeyframes();
+    Check(!PairUnchanged(action), "removed endpoint cannot redirect queued edit to another pair");
+}
+
+void TestClosePreservesQueuedEdit() {
+    ResetFixture();
+    g_pending = {}; g_closeAfterPending = false; g_closing = false; g_transition = false;
+    g_displayKeys = g_kfs;
+    for (auto& key : g_displayKeys) key.value = {};
+    Queue(ActionKind::Preset, 5);
+    Queue(ActionKind::Close);
+    Check(g_pending.kind == ActionKind::Preset && g_pending.index == 5 && g_closeAfterPending,
+        "close waits for the committed edit instead of replacing it");
+    Check(g_pending.hasPair && g_pending.keys[0].time == g_kfs[0].time,
+        "pending edit retains its exact endpoint snapshot while close waits");
+    g_pending = {}; g_closeAfterPending = false; g_displayKeys.clear();
+}
+
 std::string ReadBytes(const std::filesystem::path& path) {
     std::ifstream input(path, std::ios::binary);
     return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
@@ -424,6 +472,9 @@ int main() {
     TestFailuresAndRollback();
     TestRovingAndEqualValues();
     TestRefreshFailureAfterWrite();
+    TestHandleSliders();
+    TestStaleQueuedPair();
+    TestClosePreservesQueuedEdit();
     TestPresetStorageWrapper();
     if (failures != 0) {
         std::cerr << failures << " integration test(s) failed\n";

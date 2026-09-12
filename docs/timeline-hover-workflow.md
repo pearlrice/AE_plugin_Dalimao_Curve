@@ -1,3 +1,5 @@
+> 历史方案记录：当前版本已移除自绘曲线与像素时间轴推测，采用 AE 原生图形编辑器及明确的属性/段落选择。当前行为见 [原生曲线说明](native-graph-editor.md)。
+
 # Timeline Hover Editing
 
 ## Requested behavior

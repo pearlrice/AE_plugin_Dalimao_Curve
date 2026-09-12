@@ -1,5 +1,4 @@
-// Included after the graph geometry/text helpers. All AE calls stay inside
-// the panel's AEGP command callback; the pure preset model has no AE dependency.
+// AE operations are called only from AEGP command/idle callbacks.
 static std::vector<curve_presets::Preset> g_userPresets;
 static std::wstring g_presetPath;
 static std::string g_presetDisk;
@@ -245,7 +244,8 @@ static bool SamePresetKey(const PresetKeyState& actual, const PresetKeyState& ex
     return true;
 }
 
-static void ApplySegmentPreset(const curve_presets::Preset& preset) {
+static void ApplySegmentPreset(const curve_presets::Preset& preset,
+                               const double* rawOut = nullptr, const double* rawIn = nullptr) {
     AEGP_SuiteHandler suites(g_sp);
     PresetKeyState before[2];
     double delta = 0, duration = 0, outSpeed = 0, inSpeed = 0;
@@ -257,7 +257,11 @@ static void ApplySegmentPreset(const curve_presets::Preset& preset) {
     auto effective = preset;
     if (effective.outType != curve_presets::Interpolation::Bezier) effective.outSlope = 0;
     if (effective.inType != curve_presets::Interpolation::Bezier) effective.inSlope = 0;
-    if (!curve_presets::Speeds(effective, delta, duration, outSpeed, inSpeed) ||
+    bool valid = curve_presets::IsValid(effective);
+    if (rawOut && rawIn) { outSpeed = *rawOut; inSpeed = *rawIn;
+        valid = valid && std::isfinite(outSpeed) && std::isfinite(inSpeed);
+    } else valid = valid && curve_presets::Speeds(effective, delta, duration, outSpeed, inSpeed);
+    if (!valid ||
         (IsSpatialPresetProperty(pi) && (outSpeed < 0 || inSpeed < 0))) {
         p.presetStatus = L"模板无法用于此段：值差为零或空间速度为负";
         return;
@@ -310,7 +314,6 @@ static void ApplySegmentPreset(const curve_presets::Preset& preset) {
     }
     A_Err endError = utility->AEGP_EndUndoGroup();
     int segment = p.presetSegment;
-    double view = g_viewT0, zoom = g_pxPerSec;
     ReloadKeyframes();
     if (p.curProp < 0) {
         p.toast = true;
@@ -319,11 +322,10 @@ static void ApplySegmentPreset(const curve_presets::Preset& preset) {
     }
     p.presetSegment = segment;
     p.selKf = segment;
-    g_viewT0 = view; g_pxPerSec = zoom;
     p.presetStatus = rollbackFailed ? L"应用及恢复失败，请关闭面板后在 AE 中撤销" :
         failed ? L"AE 未接受此曲线，已恢复原样" :
         endError ? L"已应用，但撤销组关闭失败，请检查 AE" :
-        L"已应用到高亮段落 · 关闭面板后 Ctrl+Z 撤销";
+        L"已应用到所选两帧 · 在 AE 中 Ctrl+Z 撤销";
     CurvesDebugLog(p.presetStatus.c_str());
 }
 
@@ -360,108 +362,15 @@ static void CaptureSegmentPreset() {
     }
 }
 
-static RECT PresetButtonRect(int i) { return { 16 + i * 116, 380, 124 + i * 116, 428 }; }
-static RECT SegmentPrevRect() { return { 16, 346, 44, 372 }; }
-static RECT SegmentNextRect() { return { 48, 346, 76, 372 }; }
-static RECT PresetDimRect() { return { 574, 346, 704, 372 }; }
-static RECT LibraryPrevRect() { return { 16, 438, 44, 464 }; }
-static RECT LibraryNextRect() { return { 278, 438, 306, 464 }; }
-static RECT LibrarySaveRect() { return { 322, 438, 438, 464 }; }
-static RECT LibraryApplyRect() { return { 446, 438, 562, 464 }; }
-static RECT LibraryDeleteRect() { return { 570, 438, 650, 464 }; }
-static RECT LibraryReloadRect() { return { 658, 438, 704, 464 }; }
 
-static void RenderPresetToolbar(Graphics& g, Font& font, Font& smallFont) {
-    SolidBrush fill(Color(255, 40, 45, 53)), text(Color(255, 226, 232, 241));
-    SolidBrush muted(Color(255, 154, 167, 185)), accent(Color(255, 100, 188, 255));
-    Pen border(Color(255, 68, 83, 101));
-    auto button = [&](RECT rect, const wchar_t* label) {
-        g.FillRectangle(&fill, (int)rect.left, (int)rect.top, (int)(rect.right - rect.left), (int)(rect.bottom - rect.top));
-        g.DrawRectangle(&border, (int)rect.left, (int)rect.top, (int)(rect.right - rect.left - 1), (int)(rect.bottom - rect.top - 1));
-        DrawTextCentered(g, label, font, text, rect);
-    };
-    button(SegmentPrevRect(), L"‹"); button(SegmentNextRect(), L"›");
-    wchar_t segment[128] = L"当前属性至少需要两个关键帧";
-    int s = g_panel.presetSegment;
-    if (s >= 0 && s + 1 < (int)g_kfs.size())
-        _snwprintf_s(segment, _TRUNCATE, L"编辑段落  %d → %d    %.3fs — %.3fs", s + 1, s + 2, g_kfs[s].time, g_kfs[s + 1].time);
-    DrawText(g, segment, font, accent, 88, 352);
-    const auto& pi = g_props[g_panel.curProp];
-    static const wchar_t* axes[] = { L"模板编辑轴：X ▸", L"模板编辑轴：Y ▸", L"模板编辑轴：Z ▸" };
-    button(PresetDimRect(), IsSpatialPresetProperty(pi) ? L"空间速度（共用）" :
-           pi.numDims == 1 ? L"模板编辑轴：数值" : axes[ClampI(g_panel.presetDim, 0, 2)]);
-    static const wchar_t* names[] = { L"线性", L"标准缓动", L"左长右短", L"左短右长", L"双侧强缓动", L"双侧最长" };
-    static const wchar_t* amounts[] = { L"Linear", L"33 / 33", L"100 / 0.1", L"0.1 / 100", L"67 / 67", L"100 / 100" };
-    const auto builtins = curve_presets::Builtins();
-    for (int i = 0; i < 6; ++i) {
-        RECT rect = PresetButtonRect(i);
-        button(rect, L"");
-        DrawText(g, names[i], smallFont, text, (float)rect.left + 42, (float)rect.top + 7);
-        DrawText(g, amounts[i], smallFont, muted, (float)rect.left + 42, (float)rect.top + 26);
-        const auto& item = builtins[i];
-        float x = (float)rect.left + 7, y = (float)rect.bottom - 10, w = 28, h = 27;
-        Pen curve(Color(255, 100, 188, 255), 1.7f);
-        if (i == 0) g.DrawLine(&curve, x, y, x + w, y - h);
-        else g.DrawBezier(&curve, PointF(x, y), PointF(x + w * (float)item.outInfluence / 100, y),
-                          PointF(x + w * (1 - (float)item.inInfluence / 100), y - h), PointF(x + w, y - h));
-    }
-    button(LibraryPrevRect(), L"‹"); button(LibraryNextRect(), L"›");
-    std::wstring library = L"尚无模板，调整曲线后点保存";
-    if (!g_userPresets.empty()) {
-        int index = ClampI(g_panel.libraryIndex, 0, (int)g_userPresets.size() - 1);
-        const auto& name = g_userPresets[index].name;
-        library = std::to_wstring(index + 1) + L"/" + std::to_wstring(g_userPresets.size()) + L"  " + std::wstring(name.begin(), name.end());
-    }
-    DrawText(g, library, smallFont, text, 52, 445);
-    button(LibrarySaveRect(), L"保存当前段"); button(LibraryApplyRect(), L"应用模板");
-    button(LibraryDeleteRect(), L"删除模板"); button(LibraryReloadRect(), L"重载");
-    const std::wstring message = g_panel.presetStatus.empty() ?
-        L"先选择段落和编辑轴，再点样式；保存的是左帧出侧 + 右帧入侧。" : g_panel.presetStatus;
-    DrawText(g, message, smallFont, muted, 16, 480);
-}
-
-static bool HandlePresetToolbar(int x, int y) {
-    if (y < 346 || y >= 494) return false;
-    auto& p = g_panel;
-    if (PointInRect(SegmentPrevRect(), x, y) || PointInRect(SegmentNextRect(), x, y)) {
-        if (g_kfs.size() >= 2) {
-            p.presetSegment = ClampI(p.presetSegment + (x < 44 ? -1 : 1), 0, (int)g_kfs.size() - 2);
-            p.selKf = p.presetSegment;
-            g_viewT0 = (g_kfs[p.presetSegment].time + g_kfs[p.presetSegment + 1].time - VisibleSpanSec()) * 0.5;
-            p.presetStatus.clear();
-        }
-        return true;
-    }
-    if (PointInRect(PresetDimRect(), x, y) && p.curProp >= 0) {
-        const auto& pi = g_props[p.curProp];
-        if (!IsSpatialPresetProperty(pi)) {
-            p.presetDim = (p.presetDim + 1) % pi.numDims;
-            p.dimMask = 1 << p.presetDim;
-        }
-        p.presetStatus.clear();
-        return true;
-    }
-    for (int i = 0; i < 6; ++i) if (PointInRect(PresetButtonRect(i), x, y)) {
-        ApplySegmentPreset(curve_presets::Builtins()[i]);
-        return true;
-    }
-    if (PointInRect(LibrarySaveRect(), x, y)) CaptureSegmentPreset();
-    else if (PointInRect(LibraryApplyRect(), x, y)) {
-        if (!g_userPresets.empty()) ApplySegmentPreset(g_userPresets[ClampI(p.libraryIndex, 0, (int)g_userPresets.size() - 1)]);
-        else p.presetStatus = L"请先保存一个曲线模板";
-    } else if (PointInRect(LibraryDeleteRect(), x, y) && !g_userPresets.empty()) {
-        auto next = g_userPresets;
-        int index = ClampI(p.libraryIndex, 0, (int)next.size() - 1);
-        next.erase(next.begin() + index);
-        if (SavePresetLibrary(next)) {
-            p.libraryIndex = next.empty() ? 0 : ClampI(index, 0, (int)next.size() - 1);
-            p.presetStatus = L"已删除所选模板";
-        }
-    } else if (PointInRect(LibraryReloadRect(), x, y)) {
-        p.presetStatus.clear(); LoadPresetLibrary();
-    } else if (!g_userPresets.empty() && (PointInRect(LibraryPrevRect(), x, y) || PointInRect(LibraryNextRect(), x, y))) {
-        p.libraryIndex = (p.libraryIndex + (x < 44 ? -1 : 1) + (int)g_userPresets.size()) % (int)g_userPresets.size();
-        p.presetStatus.clear();
-    }
-    return true;
+static void ApplyHandleInfluences(double outPercent, double inPercent) {
+    AEGP_SuiteHandler suites(g_sp);
+    PresetKeyState keys[2]; double delta = 0, duration = 0; int dim = 0;
+    if (!ReadPresetSegment(suites, keys, delta, duration, dim)) return;
+    curve_presets::Preset preset;
+    preset.name = "Handle length";
+    preset.outInfluence = outPercent; preset.inInfluence = inPercent;
+    double outSpeed = keys[0].outType == AEGP_KeyInterp_BEZIER ? keys[0].out[dim].speedF : 0;
+    double inSpeed = keys[1].inType == AEGP_KeyInterp_BEZIER ? keys[1].in[dim].speedF : 0;
+    ApplySegmentPreset(preset, &outSpeed, &inSpeed);
 }
