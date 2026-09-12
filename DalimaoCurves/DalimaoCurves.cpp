@@ -1,6 +1,8 @@
 #include "pch.h"
 #include <commctrl.h>
 #include <shlobj.h>
+#include <shellscalingapi.h>
+#include <windowsx.h>
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -22,6 +24,7 @@
 #include "NativeGraphBridge.h"
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "shcore.lib")
 
 void AEGP_SuiteHandler::MissingSuiteError() const { throw std::runtime_error("AE Suite unavailable"); }
 static SPBasicSuite* g_sp = nullptr;
@@ -31,6 +34,7 @@ static HWND g_ae_main = nullptr;
 static HMODULE g_module = nullptr;
 static std::wstring g_plugin_dir;
 static bool s_panel_active = false;
+static POINT g_popupOrigin{};
 
 struct PropertyInfo {
     AEGP_StreamRefH streamH = nullptr;
@@ -340,10 +344,13 @@ static void ProcessAction(const Action& action) {
     SnapshotDisplay(); UpdateControls();
 }
 
+#include "CurvePopupUI.inl"
+
 static void DestroyControls() {
     g_pending = {};
     if (g_panel.hwnd) DestroyWindow(g_panel.hwnd);
     g_panel.hwnd = nullptr; s_panel_active = false;
+    popup_ui::Cleanup();
     g_closing = false; g_transition = false; g_closeAfterPending = false;
     g_displayKeys.clear(); g_displayProps.clear(); g_target = {};
 }
@@ -378,6 +385,27 @@ static LRESULT CALLBACK KeyboardHook(int code, WPARAM wParam, LPARAM lParam) {
 }
 static LRESULT CALLBACK ControlsWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
+    case WM_PAINT: popup_ui::Paint(hwnd); return 0;
+    case WM_DPICHANGED:
+        popup_ui::ChangeDpi(hwnd, HIWORD(wParam), *reinterpret_cast<RECT*>(lParam)); return 0;
+    case WM_ERASEBKGND: return 1;
+    case WM_DRAWITEM:
+        if (popup_ui::DrawItem(reinterpret_cast<const DRAWITEMSTRUCT*>(lParam))) return TRUE;
+        break;
+    case WM_MEASUREITEM:
+        if (popup_ui::MeasureItem(reinterpret_cast<MEASUREITEMSTRUCT*>(lParam))) return TRUE;
+        break;
+    case WM_CTLCOLORSTATIC: case WM_CTLCOLORBTN: case WM_CTLCOLOREDIT: case WM_CTLCOLORLISTBOX:
+        return reinterpret_cast<LRESULT>(popup_ui::ControlColor(reinterpret_cast<HDC>(wParam), reinterpret_cast<HWND>(lParam), message));
+    case WM_NOTIFY:
+        if (reinterpret_cast<NMHDR*>(lParam)->code == NM_CUSTOMDRAW) return popup_ui::CustomDraw(reinterpret_cast<NMHDR*>(lParam));
+        break;
+    case WM_NCHITTEST: {
+        POINT point{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) }; ScreenToClient(hwnd, &point);
+        RECT client{}; GetClientRect(hwnd, &client);
+        if (point.y >= 0 && point.y < popup_ui::HeaderHeight() && point.x < client.right - popup_ui::HeaderHeight()) return HTCAPTION;
+        return HTCLIENT;
+    }
     case WM_CLOSE: Queue(ActionKind::Close); return 0;
     case WM_COMMAND: {
         int id = LOWORD(wParam), event = HIWORD(wParam);
@@ -406,45 +434,28 @@ static LRESULT CALLBACK ControlsWndProc(HWND hwnd, UINT message, WPARAM wParam, 
     return DefWindowProcW(hwnd, message, wParam, lParam);
 }
 static void CreateControls() {
+    HMONITOR monitor = MonitorFromPoint(g_popupOrigin, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO info{ sizeof(info) };
+    if (!GetMonitorInfoW(monitor, &info)) SystemParametersInfoW(SPI_GETWORKAREA, 0, &info.rcWork, 0);
+    UINT dpiX = 96, dpiY = 96;
+    if (FAILED(GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &dpiX, &dpiY))) dpiX = GetDpiForWindow(g_ae_main);
+    if (!dpiX) dpiX = 96;
+    popup_ui::Initialize(dpiX);
     INITCOMMONCONTROLSEX common{ sizeof(common), ICC_BAR_CLASSES }; InitCommonControlsEx(&common);
     WNDCLASSW wc{}; wc.hInstance = g_module; wc.lpfnWndProc = ControlsWndProc;
-    wc.lpszClassName = L"DalimaoNativeCurveControls"; wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-    wc.hbrBackground = HBRUSH(COLOR_BTNFACE + 1); RegisterClassW(&wc);
-    RECT owner{}; GetWindowRect(g_ae_main, &owner);
-    g_panel.hwnd = CreateWindowExW(WS_EX_TOOLWINDOW, wc.lpszClassName, L"Dalimao Curves 2 · 原生曲线工具",
-        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, owner.right - 570, owner.top + 120, 550, 525,
+    wc.lpszClassName = L"DalimaoCurveCursorPopup"; wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    wc.style = CS_DROPSHADOW; RegisterClassW(&wc);
+    RECT bounds = popup_ui::CursorPlacement(g_popupOrigin, info.rcWork, dpiX);
+    g_panel.hwnd = CreateWindowExW(WS_EX_TOOLWINDOW, wc.lpszClassName, L"Dalimao Curves · 鼠标浮窗",
+        WS_POPUP | WS_CLIPCHILDREN, bounds.left, bounds.top, bounds.right - bounds.left, bounds.bottom - bounds.top,
         g_ae_main, nullptr, g_module, nullptr);
-    if (!g_panel.hwnd) throw std::runtime_error("Unable to create controls");
-    auto add = [](const wchar_t* type, const wchar_t* text, int id, int x, int y, int width, int height, DWORD style = 0) {
-        HWND control = CreateWindowExW(0, type, text, WS_CHILD | WS_VISIBLE | style, x, y, width, height,
-            g_panel.hwnd, HMENU(INT_PTR(id)), g_module, nullptr);
-        SendMessageW(control, WM_SETFONT, WPARAM(GetStockObject(DEFAULT_GUI_FONT)), TRUE);
-        return control;
-    };
-    add(L"STATIC", L"在 AE 原生图形编辑器中查看曲线；此窗口编辑所选两帧。", 0, 16, 12, 510, 22);
-    add(L"BUTTON", L"读取 AE 选择", REFRESH, 16, 40, 128, 28, WS_TABSTOP);
-    add(L"BUTTON", L"返回图层滑条", RETURN_LAYERS, 354, 40, 166, 28, WS_TABSTOP);
-    add(L"COMBOBOX", L"", PROP, 16, 80, 504, 240, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP);
-    add(L"COMBOBOX", L"", SEGMENT, 16, 112, 336, 240, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP);
-    add(L"COMBOBOX", L"", DIMENSION, 364, 112, 156, 120, CBS_DROPDOWNLIST | WS_TABSTOP);
-    const wchar_t* names[] = { L"线性", L"标准缓动", L"出长 / 入短", L"出短 / 入长", L"双侧较长", L"双侧最长" };
-    for (int i = 0; i < 6; ++i) add(L"BUTTON", names[i], PRESET + i, 16 + (i % 3) * 172, 154 + (i / 3) * 36, 160, 30, WS_TABSTOP);
-    add(L"STATIC", L"", OUT_LABEL, 16, 234, 490, 22);
-    HWND out = add(TRACKBAR_CLASSW, L"起点出手柄长度", OUT_SLIDER, 16, 258, 504, 30, TBS_HORZ | WS_TABSTOP);
-    add(L"STATIC", L"", IN_LABEL, 16, 292, 490, 22);
-    HWND in = add(TRACKBAR_CLASSW, L"终点入手柄长度", IN_SLIDER, 16, 316, 504, 30, TBS_HORZ | WS_TABSTOP);
-    for (HWND slider : { out, in }) {
-        SendMessageW(slider, TBM_SETRANGE, TRUE, MAKELONG(1, 1000));
-        SendMessageW(slider, TBM_SETPAGESIZE, 0, 100);
-    }
-    add(L"STATIC", L"松开滑块应用一次修改；已有贝塞尔速度保持不变。", 0, 16, 348, 504, 20);
-    add(L"COMBOBOX", L"", LIBRARY, 16, 380, 220, 180, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP);
-    add(L"BUTTON", L"保存此段", SAVE, 246, 378, 88, 28, WS_TABSTOP);
-    add(L"BUTTON", L"应用模板", APPLY, 340, 378, 88, 28, WS_TABSTOP);
-    add(L"BUTTON", L"删除", DELETE_PRESET, 434, 378, 86, 28, WS_TABSTOP);
-    add(L"BUTTON", L"重载模板库", RELOAD, 16, 416, 114, 28, WS_TABSTOP);
-    add(L"STATIC", L"", STATUS, 140, 416, 380, 60);
+    if (!g_panel.hwnd) { popup_ui::Cleanup(); throw std::runtime_error("Unable to create cursor popup"); }
+    popup_ui::CreateChildren(g_panel.hwnd);
     ShowWindow(g_panel.hwnd, SW_SHOWNOACTIVATE);
+    wchar_t placement[256]{};
+    swprintf_s(placement, L"Cursor popup: origin=(%ld,%ld) bounds=(%ld,%ld,%ld,%ld) dpi=%u",
+        g_popupOrigin.x, g_popupOrigin.y, bounds.left, bounds.top, bounds.right, bounds.bottom, dpiX);
+    CurvesDebugLog(placement);
 }
 static BOOL CALLBACK FindAeWindow(HWND hwnd, LPARAM result) {
     DWORD pid = 0; GetWindowThreadProcessId(hwnd, &pid); wchar_t cls[128]{};
@@ -475,6 +486,7 @@ static A_Err CommandHook(AEGP_GlobalRefcon, AEGP_CommandRefcon, AEGP_Command com
     *handled = TRUE;
     try {
         if (s_panel_active) { g_activationHeld = g_shortcut != 0; Queue(ActionKind::Close); return A_Err_NONE; }
+        GetCursorPos(&g_popupOrigin);
         CaptureShortcut(); EnumWindows(FindAeWindow, LPARAM(&g_ae_main));
         if (g_shortcut == VK_F3 && g_shift && !g_ctrl && !g_alt) {
             MessageBoxW(g_ae_main, L"Shift+F3 用于 AE 原生曲线切换。请给 DalimaoCurves 分配其他快捷键，例如 4。", L"Dalimao Curves", MB_OK);
@@ -525,6 +537,7 @@ static A_Err UpdateMenuHook(AEGP_GlobalRefcon, AEGP_UpdateMenuRefcon, AEGP_Windo
 static A_Err DeathHook(AEGP_GlobalRefcon, AEGP_DeathRefcon) {
     if (g_keyboardHook) UnhookWindowsHookEx(g_keyboardHook);
     if (g_panel.hwnd) DestroyWindow(g_panel.hwnd);
+    popup_ui::Cleanup();
     native_graph::Shutdown(); return A_Err_NONE;
 }
 extern "C" DllExport A_Err EntryPointFunc(SPBasicSuite* basic, A_long, A_long,
