@@ -157,6 +157,8 @@
     </Manifest>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClInclude Include="CurvePresetModel.h" />
+    <ClInclude Include="CurvePresetPanel.inl" />
     <ClInclude Include="framework.h" />
     <ClInclude Include="pch.h" />
   </ItemGroup>

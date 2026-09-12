@@ -21,6 +21,7 @@
 #include <windowsx.h>
 #include <objidl.h>
 #include <gdiplus.h>
+#include <shlobj.h>
 
 #include <algorithm>
 #include <cmath>
@@ -29,6 +30,13 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <array>
+#include <fstream>
+#include <sstream>
+#include <filesystem>
+#undef min
+#undef max
+#include "CurvePresetModel.h"
 
 #include "AEConfig.h"
 #include "entry.h"
@@ -37,6 +45,7 @@
 #include "AEGP_SuiteHandler.h"
 
 #pragma comment(lib, "gdiplus.lib")
+#pragma comment(lib, "shell32.lib")
 
 using namespace Gdiplus;
 
@@ -47,11 +56,11 @@ void AEGP_SuiteHandler::MissingSuiteError() const {
 
 // ---------------- Layout ----------------
 static const int CP_W = 720;
-static const int CP_H = 400;
+static const int CP_H = 560;
 static const int GRAPH_L = 56;        // left margin reserved for Y-axis labels
 static const int GRAPH_T = 76;
 static const int GRAPH_R = CP_W - 16;
-static const int GRAPH_B = CP_H - 64;
+static const int GRAPH_B = CP_H - 224;
 static const int BOTTOM_T = CP_H - 58;
 static const int LEAVE_MARGIN = 40;       // 移出面板超过该距离即关闭
 static const int DD_ROW_H = 24;
@@ -128,6 +137,10 @@ struct PanelState {
     int dimMask = 3;             // which axes are shown (bit 0 = X, 1 = Y, 2 = Z); default X+Y
     int dragDim = 0;             // dimension the current drag is editing
     int graphMode = GRAPH_VALUE;
+    int presetSegment = 0;
+    int presetDim = 0;
+    int libraryIndex = 0;
+    std::wstring presetStatus;
 
     bool moving = false;               // middle-button panel drag
     int moveStartX = 0, moveStartY = 0;
@@ -455,10 +468,17 @@ static void CenterViewOnKeys() {
 
 static void ReloadKeyframes() {
     AEGP_SuiteHandler suites(g_sp);
+    DisposeKeyframes(suites);
     g_kfs.clear();
     g_panel.selKf = -1;
     if (g_panel.curProp < 0 || g_panel.curProp >= (int)g_props.size()) return;
-    const PropertyInfo& pi = g_props[g_panel.curProp];
+    PropertyInfo& pi = g_props[g_panel.curProp];
+    A_long count = 0;
+    if (suites.KeyframeSuite5()->AEGP_GetStreamNumKFs(pi.streamH, &count)) {
+        g_panel.curProp = -1;
+        return;
+    }
+    pi.numKFs = count;
     double vmin[3] = { 0.0, 0.0, 0.0 }, vmax[3] = { 1.0, 1.0, 1.0 };
     if (!LoadKeyframes(suites, pi, g_kfs, g_tMin, g_tMax, vmin, vmax)) {
         g_panel.curProp = -1;
@@ -822,6 +842,8 @@ static void GetOutHandle(const RECT& row, int dim, int idx, double& hx, double& 
     if (hy > row.bottom - 5) hy = row.bottom - 5;
 }
 
+#include "CurvePresetPanel.inl"
+
 static void RenderCurvePanel() {
     PanelState& p = g_panel;
     HDC hdcScreen = GetDC(NULL);
@@ -959,12 +981,22 @@ static void RenderCurvePanel() {
             }
         }
 
+        // Highlight the explicit segment targeted by the preset toolbar.
+        if (p.presetSegment >= 0 && p.presetSegment + 1 < (int)g_kfs.size()) {
+            float left = (float)ClampD(TimeToX(g_kfs[p.presetSegment].time), GRAPH_L, GRAPH_R);
+            float right = (float)ClampD(TimeToX(g_kfs[p.presetSegment + 1].time), GRAPH_L, GRAPH_R);
+            SolidBrush segmentBrush(Color(28, 80, 160, 255));
+            if (right > left) g.FillRectangle(&segmentBrush, left, (float)GRAPH_T,
+                                             right - left, (float)(GRAPH_B - GRAPH_T));
+        }
         // ---- graph (transparent; one row per selected axis) ----
         int dims[3];
         int rowCount = SelectedDims(dims);
         double visSpan = (double)(GRAPH_R - GRAPH_L) / g_pxPerSec;
         static const wchar_t* DL[] = { L"X", L"Y", L"Z" };
 
+        GraphicsState graphClip = g.Save();
+        g.SetClip(Rect(0, GRAPH_T - 10, CP_W, GRAPH_B - GRAPH_T + 20));
         if (p.graphMode == GRAPH_SPEED) {
             AEGP_SuiteHandler suites(g_sp);
             double h = visSpan / (CURVE_SAMPLES - 1);
@@ -1096,6 +1128,7 @@ static void RenderCurvePanel() {
             }
         }
 
+        g.Restore(graphClip);
         // ---- dropdown (popup over graph) ----
         if (p.dropdownOpen && !g_props.empty()) {
             RECT dd = DropdownRect();
@@ -1119,6 +1152,8 @@ static void RenderCurvePanel() {
                          (float)(row.left + 6), (float)(row.top + 4));
             }
         }
+
+        RenderPresetToolbar(g, uiFont, smallFont);
 
         // ---- bottom hints ----
         if (p.graphMode == GRAPH_SPEED) {
@@ -1528,6 +1563,9 @@ static void SelectProperty(int idx) {
     g_panel.dimMask = 3;
     g_panel.dropdownOpen = false;
     g_panel.ddScroll = 0;
+    g_panel.presetSegment = 0;
+    g_panel.presetDim = 0;
+    g_panel.presetStatus.clear();
     ReloadKeyframes();
 }
 
@@ -1704,6 +1742,10 @@ static LRESULT CALLBACK CurvesWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         }
         PropertyInfo* pi = (p.curProp >= 0 && p.curProp < (int)g_props.size())
                                ? &g_props[p.curProp] : nullptr;
+        if (HandlePresetToolbar(x, y)) {
+            RenderCurvePanel();
+            return 0;
+        }
         // graph mode toggle
         for (int m = 0; m < 2; m++) {
             if (PointInRect(ModeButtonRect(m), x, y)) {
@@ -1743,6 +1785,13 @@ static LRESULT CALLBACK CurvesWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             return 0;
         }
         HitTestGraph(x, y);
+        if (p.selKf >= 0 && g_kfs.size() >= 2) {
+            bool incoming = p.dragMode == DRAG_IN || p.dragMode == DRAG_SPEED_IN;
+            p.presetSegment = ClampI(p.selKf - (incoming ? 1 : 0), 0, (int)g_kfs.size() - 2);
+            p.presetDim = p.dragDim;
+            p.presetStatus.clear();
+            RenderCurvePanel();
+        }
         return 0;
     }
     case WM_MOUSEMOVE: {
@@ -2624,6 +2673,7 @@ static void ShowCurvesPanel() {
     AEGP_SuiteHandler suites(g_sp);
 
     LoadPanelShortcuts();
+    LoadPresetLibrary();
 
     POINT cur;
     GetCursorPos(&cur);
