@@ -59,9 +59,14 @@ static std::vector<KfInfo> g_kfs;
 static void CurvesDebugLog(const wchar_t* message) {
     OutputDebugStringW(message);
     if (g_plugin_dir.empty()) return;
-    CreateDirectoryW((g_plugin_dir + L"\\debug").c_str(), nullptr);
+    // The installed AEX lives in Program Files. Runtime diagnostics must go
+    // to a user-writable directory, otherwise failed toggles leave no evidence.
+    wchar_t appData[MAX_PATH]{};
+    if (FAILED(SHGetFolderPathW(nullptr, CSIDL_APPDATA, nullptr, SHGFP_TYPE_CURRENT, appData))) return;
+    std::wstring directory = std::wstring(appData) + L"\\DalimaoCurves";
+    CreateDirectoryW(directory.c_str(), nullptr);
     FILE* file = nullptr;
-    _wfopen_s(&file, (g_plugin_dir + L"\\debug\\DalimaoCurves.log").c_str(), L"a, ccs=UTF-8");
+    _wfopen_s(&file, (directory + L"\\native-graph.log").c_str(), L"a, ccs=UTF-8");
     if (file) { fwprintf(file, L"%s\n", message); fclose(file); }
 }
 static double TimeToSec(const A_Time& t) { return t.scale ? double(t.value) / t.scale : 0; }
@@ -346,6 +351,7 @@ static void ClosePanel() {
     if (g_closing) return;
     g_closing = true; g_transition = true;
     native_graph::Close();
+    CurvesDebugLog(L"Shortcut close: requesting native layer bars");
     g_panel.presetStatus = L"正在返回 AE 图层滑条…";
     UpdateControls();
 }
@@ -405,7 +411,7 @@ static void CreateControls() {
     wc.lpszClassName = L"DalimaoNativeCurveControls"; wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
     wc.hbrBackground = HBRUSH(COLOR_BTNFACE + 1); RegisterClassW(&wc);
     RECT owner{}; GetWindowRect(g_ae_main, &owner);
-    g_panel.hwnd = CreateWindowExW(WS_EX_TOOLWINDOW, wc.lpszClassName, L"Dalimao Curves · AE 原生曲线",
+    g_panel.hwnd = CreateWindowExW(WS_EX_TOOLWINDOW, wc.lpszClassName, L"Dalimao Curves 2 · 原生曲线工具",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, owner.right - 570, owner.top + 120, 550, 525,
         g_ae_main, nullptr, g_module, nullptr);
     if (!g_panel.hwnd) throw std::runtime_error("Unable to create controls");
@@ -475,6 +481,7 @@ static A_Err CommandHook(AEGP_GlobalRefcon, AEGP_CommandRefcon, AEGP_Command com
             return A_Err_NONE;
         }
         if (!g_ae_main || !native_graph::Open(g_ae_main)) { CurvesDebugLog(native_graph::Status().c_str()); return A_Err_NONE; }
+        CurvesDebugLog(L"Shortcut open: requesting native Graph Editor; no custom graph");
         g_panel = {}; s_panel_active = true; g_transition = true;
         LoadPresetLibrary(); CreateControls();
         Action initial; initial.kind = ActionKind::Refresh; ProcessAction(initial);
@@ -486,6 +493,7 @@ static A_Err IdleHook(AEGP_GlobalRefcon, AEGP_IdleRefcon, A_long* sleep) {
     if (!s_panel_active) return A_Err_NONE;
     *sleep = std::min<A_long>(*sleep, 6);
     if (g_transition && !native_graph::Busy()) {
+        CurvesDebugLog(native_graph::Status().c_str());
         g_transition = false;
         if (native_graph::Failed()) {
             g_closing = false;
@@ -535,6 +543,6 @@ extern "C" DllExport A_Err EntryPointFunc(SPBasicSuite* basic, A_long, A_long,
         ERR(suites.RegisterSuite5()->AEGP_RegisterIdleHook(pluginId, IdleHook, nullptr));
         ERR(suites.RegisterSuite5()->AEGP_RegisterDeathHook(pluginId, DeathHook, nullptr));
         if (!err) g_keyboardHook = SetWindowsHookExW(WH_GETMESSAGE, KeyboardHook, nullptr, GetCurrentThreadId());
-        CurvesDebugLog(L"Native Graph Editor controls loaded"); return err;
+        CurvesDebugLog(L"Dalimao Curves 2 loaded: native graph, presets, templates and handle sliders"); return err;
     } catch (...) { return A_Err_GENERIC; }
 }

@@ -36,4 +36,4 @@ SDK 已解压到项目内，工程使用相对路径引用。完整的组件版�
 ## 说明
 
 - 独立 git 仓库，改动在本地提交，不推送（除非明确要求）。
-- 调试日志写入插件目录 `debug\DalimaoCurves.log`。
+- 原生面板诊断日志写入 `%APPDATA%\DalimaoCurves\native-graph.log`。工具窗口标题为 `Dalimao Curves 2 · 原生曲线工具`，用于区分仍带自绘曲线的旧版本。
