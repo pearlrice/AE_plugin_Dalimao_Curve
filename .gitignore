@@ -12,6 +12,9 @@ Release/
 *.pch
 
 # SDK headers (copied locally for build)
+/AfterEffectsSDK_25.6_61_win/
+/AfterEffectsSDK_25.6_61_win.zip
+__pycache__/
 A*.h
 FIEL_Public.h
 Mach-O_prefix.h

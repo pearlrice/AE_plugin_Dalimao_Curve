@@ -6,8 +6,11 @@
 
 $ErrorActionPreference = 'Stop'
 
-$projectRoot = 'D:\Adobe\AE_Plugin_dev\DalimaoCurves'
-$aeExe       = 'D:\Adobe\Adobe After Effects 2024\Support Files\AfterFX.exe'
+$projectRoot = $PSScriptRoot
+$aeSupportDir = if ($env:AE_SUPPORT_DIR) { $env:AE_SUPPORT_DIR } else {
+    Join-Path $env:ProgramFiles 'Adobe\Adobe After Effects 2025\Support Files'
+}
+$aeExe       = Join-Path $aeSupportDir 'AfterFX.exe'
 $testProject = Join-Path $projectRoot 'test project.aep'
 
 if (-not (Test-Path $aeExe)) {
@@ -223,7 +226,7 @@ if ($proc) {
 
 Push-Location $projectRoot
 try {
-    python deploy.py --build --clear-cache
+    py -3 deploy.py --build
     if ($LASTEXITCODE -ne 0) {
         throw 'deploy.py failed'
     }

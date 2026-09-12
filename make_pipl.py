@@ -6,6 +6,7 @@ Usage:
 """
 import io
 import sys
+from pathlib import Path
 
 
 def pstring(s):
@@ -47,6 +48,7 @@ if __name__ == "__main__":
         print("usage: python make_pipl.py PluginName")
         sys.exit(1)
     data = build_pipl(sys.argv[1])
-    with io.open("pipl_data.bin", "wb") as f:
+    output_path = Path(__file__).resolve().parent / 'DalimaoCurves' / 'pipl_data.bin'
+    with io.open(output_path, "wb") as f:
         f.write(data)
-    print("wrote pipl_data.bin ({0} bytes) for {1}".format(len(data), sys.argv[1]))
+    print("wrote {0} ({1} bytes) for {2}".format(output_path, len(data), sys.argv[1]))

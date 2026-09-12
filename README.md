@@ -15,16 +15,22 @@ AE AEGP 插件：通过快捷键呼出**关键帧贝塞尔曲线面板**，在�
 
 ## 构建与部署
 
-```cmd
-python deploy.py --build --clear-cache
+```powershell
+py deploy.py --check-env   # 检查本机依赖路径
+py deploy.py --build-only  # 仅编译 Release/x64，不安装、不操作 AE
+py deploy.py --build       # 编译并安装；先关闭 AE，安装需要管理员权限
+py deploy.py --verify      # 检查安装文件，并与当前构建进行 SHA-256 比对
 ```
 
-输出到 AE 2024 `Plug-ins\DalimaoCurves\`，部署后重启 AE 生效。
+本机目标为 AE 2025（25.4）的 `Support Files\Plug-ins\DalimaoCurves\`。构建产物为 `DalimaoCurves\x64\Release\DalimaoCurves.dll`，安装时命名为 `DalimaoCurves.aex`，重启 AE 后加载。检测到 AE 正在运行时，安装会停止；覆盖已有插件前会备份。
+
+SDK 已解压到项目内，工程使用相对路径引用。完整的组件版本、配置覆盖方法、开发流程和验证结果见 [开发环境说明](docs/development-environment.md)。
 
 ## 结构
 
 - `DalimaoCurves\` 插件源码工程（VS2022 / v143 / x64 Release）
-- `deploy.py` 编译 + 部署脚本（路径按本机配置）
+- `deploy.py` 环境检查、编译、安装和文件验证；构建日志在 `x64/build.log`
+- `deploy_restart.ps1` 可选的测试工程关闭/保存、编译安装和重新打开助手；使用前先阅读脚本
 - `make_pipl.py` PiPL 生成脚本（改插件名时使用）
 
 ## 说明

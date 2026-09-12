@@ -2549,8 +2549,9 @@ static bool CalibrateToTimeline() {
         if (DetectKeyDiamonds(wr, w, h, rows) && g_kfs.size() >= 2) {
             std::vector<double> samples;
             for (auto& xs : rows) {
-                int kc = (int)g_kfs.size();
-                if (abs((int)xs.size() - kc) > 3) continue;
+                // Index matching requires one detected diamond per key. A
+                // partial/noisy row is ambiguous and can overrun g_kfs.
+                if (xs.size() != g_kfs.size()) continue;
                 for (size_t i = 0; i + 1 < xs.size(); i++) {
                     double dtk = g_kfs[i + 1].time - g_kfs[i].time;
                     double dx = (double)(xs[i + 1] - xs[i]);
